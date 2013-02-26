@@ -301,8 +301,6 @@ uint8_t C41_CALL hmain (c41_cli_t * cli_p)
   // log_file = fopen("ochi.log", "w");
 
   // acx1_logging(3, log_file);
-  // z = c41_io_fmt(cli_p->stdout_p, "arg_n: $Ui.\n", cli_p->arg_n);
-
   xs = 0;
   if (cli_p->arg_n != 1)
   {
@@ -314,7 +312,7 @@ uint8_t C41_CALL hmain (c41_cli_t * cli_p)
   file_name = cli_p->arg_a[0];
 
   z = 1 + C41_STR_LEN(file_name);
-  c = c41_file_open(&cli_p->fsi, &io_p, (uint8_t const *) file_name, z,
+  c = c41_file_open(cli_p->fsi_p, &io_p, (uint8_t const *) file_name, z,
                     C41_FSI_EXF_OPEN | C41_FSI_READ);
   if (c)
   {
