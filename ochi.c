@@ -13,6 +13,9 @@ enum ochi_err_enum
   OE_NONE = 0,
   OE_NO_CODE,
   OE_STDOUT_ERROR,
+  OE_TWO_CMD,
+  OE_MISS_SH_OPT,
+  OE_UNKNOWN_OPT,
 };
 /* ename ********************************************************************/
 static char const * ename (uint_t eid)
@@ -23,6 +26,9 @@ static char const * ename (uint_t eid)
     N(OE_NONE);
     N(OE_NO_CODE);
     N(OE_STDOUT_ERROR);
+    N(OE_TWO_CMD);
+    N(OE_MISS_SH_OPT);
+    N(OE_UNKNOWN_OPT);
   default:
     return "THE_ERROR_WE_DO_NOT_PRINT_ITS_NAME";
   }
@@ -86,7 +92,6 @@ static void init (ochi_t * o, c41_cli_t * cli_p)
     return;
   }
 
-#if 0
   for (state = 0, i = 0; i < cli_p->arg_n; )
   {
     switch (state)
@@ -97,17 +102,62 @@ static void init (ochi_t * o, c41_cli_t * cli_p)
         if (cli_p->arg_a[i][1] == '-')
         {
           // long option
+          if (cli_p->arg_a[i][2] == 0) { state = 1; break; }
+          if (C41_STR_EQUAL(cli_p->arg_a[i] + 2, "help"))
+          {
+            if (o->cmd) 
+            {
+              E(OE_TWO_CMD, "too many commands");
+              o->cmd = OCMD_NOP;
+              return;
+            }
+            o->cmd = OCMD_HELP;
+            ++i;
+            break;
+          }
+          E(OE_UNKNOWN_OPT, "unknown option '$s'", cli_p->arg_a[i] + 2);
+          return;
         }
         else
         {
           // start of short opts
+          if (cli_p->arg_a[i][1] == 0)
+          {
+            E(OE_MISS_SH_OPT, "missing short option at arg $i", i + 1);
+            return;
+          }
+          state = 2;
+          j = 1;
+          continue;
         }
-
+      }
+    case 1:
+      ++i;
+      break;
+    case 2:
+      switch (cli_p->arg_a[i][j])
+      {
+      case 0:
+        state = 0;
+        ++i;
+        break;
+      case 'h': 
+        if (o->cmd) 
+        {
+          E(OE_TWO_CMD, "too many commands");
+          o->cmd = OCMD_NOP;
+          return;
+        }
+        o->cmd = OCMD_HELP;
+        ++j;
+        break;
+      default:
+        E(OE_UNKNOWN_OPT, "unknown short option '$c'", cli_p->arg_a[i][j]);
+        return;
       }
     }
   }
-#endif
-  E(OE_NO_CODE, "init not implemented");
+  //E(OE_NO_CODE, "init not implemented");
 }
 
 
