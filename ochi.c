@@ -18,6 +18,8 @@ enum ochi_err_enum
   OE_UNKNOWN_OPT,
   OE_MEM_ERROR,
   OE_ACX_INIT,
+  OE_INPUT_THREAD_CREATE,
+  OE_INPUT_THREAD_JOIN,
 };
 /* ename ********************************************************************/
 static char const * ename (uint_t eid)
@@ -33,6 +35,8 @@ static char const * ename (uint_t eid)
     N(OE_UNKNOWN_OPT);
     N(OE_MEM_ERROR);
     N(OE_ACX_INIT);
+    N(OE_INPUT_THREAD_CREATE);
+    N(OE_INPUT_THREAD_JOIN);
   default:
     return "THE_ERROR_WHOSE_NAME_WE_DO_NOT_PRINT";
   }
@@ -55,11 +59,16 @@ struct ochi_s
   uint_t        fn_n;
   uint8_t const * * fn_a;
 
+  c41_smt_tid_t input_tid;
+  c41_smt_tid_t output_tid;
+
   uint8_t       orc; // return code
   uint_t        eid; // error id
   c41_u8v_t     emsg;
   c41_ma_t *    ma_p;
+  c41_smt_t *   smt_p;
   uint8_t       acx_inited;
+  uint8_t       ith, oth;
 };
 
 #define E(_eid, ...)                                                          \
@@ -98,15 +107,6 @@ uint8_t C41_CALL output_writer (void * arg)
   return 0;
 }
 
-
-/* test_ui ******************************************************************/
-static void test_ui (ochi_t * o)
-{
-  acx1_event_t e;
-
-  acx1_read_event(&e);
-}
-
 /* set_cmd ******************************************************************/
 static int set_cmd (ochi_t * o, uint_t cmd)
 {
@@ -128,6 +128,7 @@ static void init (ochi_t * o, c41_cli_t * cli_p)
 
   C41_VAR_ZERO(*o);
   o->ma_p = cli_p->ma_p;
+  o->smt_p = cli_p->smt_p;
   c41_u8v_init(&o->emsg, cli_p->ma_p, 20);
 
   if (!cli_p->arg_n)
@@ -217,6 +218,61 @@ static void init (ochi_t * o, c41_cli_t * cli_p)
   }
 }
 
+/* init_ui ******************************************************************/
+static uint_t C41_CALL init_ui (ochi_t * o)
+{
+  uint_t c;
+
+  c = acx1_init();
+  if (c)
+  {
+    E(OE_ACX_INIT,
+      "failed initialising console ($s: $i)", acx1_status_str(c), c);
+    o->orc |= ORC_ACX_ERROR;
+    return 1;
+  }
+  o->acx_inited = 1;
+
+
+  c = c41_smt_thread_create(o->smt_p, &o->input_tid, input_reader, o);
+  if (c)
+  {
+    E(OE_INPUT_THREAD_CREATE, "failed creating input thread: $i", c);
+  }
+  else o->ith = 1;
+
+  return 0;
+}
+
+/* finish_ui ****************************************************************/
+static uint_t C41_CALL finish_ui (ochi_t * o)
+{
+  uint_t c;
+
+  if (o->acx_inited) acx1_finish();
+
+  if (o->ith)
+  {
+    c = c41_smt_thread_join(o->smt_p, o->input_tid);
+    if (c)
+    {
+      E(OE_INPUT_THREAD_JOIN, "failed joining input thread: $i", c);
+      return 1;
+    }
+  }
+  return 0;
+}
+
+/* test_ui ******************************************************************/
+static void test_ui (ochi_t * o)
+{
+  acx1_event_t e;
+
+  if (init_ui(o)) return;
+  acx1_read_event(&e);
+}
+
+
 /* hmain ********************************************************************/
 uint8_t C41_CALL hmain (c41_cli_t * cli_p)
 {
@@ -226,19 +282,6 @@ uint8_t C41_CALL hmain (c41_cli_t * cli_p)
   ochi_t * o = &os;
 
   init(&os, cli_p);
-
-  if (os.cmd >= OCMD_WITH_UI)
-  {
-    c = acx1_init();
-    if (c)
-    {
-      E(OE_ACX_INIT,
-        "failed initialising console ($s: $i)", acx1_status_str(c), c);
-      os.cmd = OCMD_NOP;
-      os.orc |= ORC_ACX_ERROR;
-    }
-    else os.acx_inited = 1;
-  }
 
   switch (os.cmd)
   {
@@ -255,10 +298,7 @@ uint8_t C41_CALL hmain (c41_cli_t * cli_p)
     break;
   }
 
-  if (os.acx_inited)
-  {
-    acx1_finish();
-  }
+  finish_ui(o);
 
   if (os.emsg.n)
   {
