@@ -7,6 +7,7 @@
 #define ORC_FILE_ERROR 2
 #define ORC_MEM_ERROR 4
 #define ORC_REPORT_ERROR 8 // error reporting error
+#define ORC_THREAD_ERROR 0x10
 
 enum ochi_err_enum
 {
@@ -18,6 +19,7 @@ enum ochi_err_enum
   OE_UNKNOWN_OPT,
   OE_MEM_ERROR,
   OE_ACX_INIT,
+  OE_ACX_READ,
   OE_INPUT_THREAD_CREATE,
   OE_INPUT_THREAD_JOIN,
 };
@@ -95,6 +97,19 @@ static void help (ochi_t * o, c41_io_t * io_p)
 uint8_t C41_CALL input_reader (void * arg)
 {
   ochi_t * o = arg;
+  acx1_event_t e;
+  uint_t c;
+
+  for (;;)
+  {
+    c = acx1_read_event(&e);
+    if (c)
+    {
+      E(OE_ACX_READ, "failed reading event: $s = $i", acx1_status_str(c), c);
+      return ORC_ACX_ERROR;
+    }
+    if (e.km == (ACX1_ALT | 'x')) break;
+  }
 
   return 0;
 }
@@ -218,10 +233,11 @@ static void init (ochi_t * o, c41_cli_t * cli_p)
   }
 }
 
-/* init_ui ******************************************************************/
-static uint_t C41_CALL init_ui (ochi_t * o)
+/* run_ui *******************************************************************/
+static void run_ui (ochi_t * o)
 {
   uint_t c;
+  int tc;
 
   c = acx1_init();
   if (c)
@@ -229,49 +245,35 @@ static uint_t C41_CALL init_ui (ochi_t * o)
     E(OE_ACX_INIT,
       "failed initialising console ($s: $i)", acx1_status_str(c), c);
     o->orc |= ORC_ACX_ERROR;
-    return 1;
+    return;
   }
   o->acx_inited = 1;
-
 
   c = c41_smt_thread_create(o->smt_p, &o->input_tid, input_reader, o);
   if (c)
   {
     E(OE_INPUT_THREAD_CREATE, "failed creating input thread: $i", c);
   }
-  else o->ith = 1;
-
-  return 0;
-}
-
-/* finish_ui ****************************************************************/
-static uint_t C41_CALL finish_ui (ochi_t * o)
-{
-  uint_t c;
-
-  if (o->acx_inited) acx1_finish();
-
-  if (o->ith)
+  else
   {
-    c = c41_smt_thread_join(o->smt_p, o->input_tid);
-    if (c)
+    tc = c41_smt_thread_join(o->smt_p, o->input_tid);
+    if (tc < 0)
     {
-      E(OE_INPUT_THREAD_JOIN, "failed joining input thread: $i", c);
-      return 1;
+      E(OE_INPUT_THREAD_JOIN, "failed joining input thread: $i", tc);
+      o->orc |= ORC_THREAD_ERROR;
+      return;
     }
+    else o->orc |= tc;
   }
-  return 0;
+  if (o->acx_inited) acx1_finish();
+  o->acx_inited = 0;
 }
 
 /* test_ui ******************************************************************/
 static void test_ui (ochi_t * o)
 {
-  acx1_event_t e;
-
-  if (init_ui(o)) return;
-  acx1_read_event(&e);
+  run_ui(o);
 }
-
 
 /* hmain ********************************************************************/
 uint8_t C41_CALL hmain (c41_cli_t * cli_p)
@@ -297,8 +299,6 @@ uint8_t C41_CALL hmain (c41_cli_t * cli_p)
     E(OE_NO_CODE, "command $i not implemented", os.cmd);
     break;
   }
-
-  finish_ui(o);
 
   if (os.emsg.n)
   {
