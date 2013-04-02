@@ -95,10 +95,19 @@ enum ochi_cmd_enum
     }                                                           \
   } while (0)
 
-#define MWAIT() do { uint_t c;                                  \
+#define OWAIT() do { uint_t c;                                  \
     c = c41_smt_cond_wait(o->smt_p, o->out_cond_p, o->main_mutex_p); \
     if (c) {                                                    \
       E(OE_OUTPUT_COND_WAIT, "output cond wait error: $i", c);  \
+      o->orc |= ORC_THREAD_ERROR;                               \
+      goto l_thread_error;                                      \
+    }                                                           \
+  } while (0)
+
+#define OSIGNAL() do { uint_t c;                                \
+    c = c41_smt_cond_signal(o->smt_p, o->out_cond_p);           \
+    if (c) {                                                    \
+      E(OE_OUTPUT_COND_SIGNAL, "output cond signal error: $i", c);  \
       o->orc |= ORC_THREAD_ERROR;                               \
       goto l_thread_error;                                      \
     }                                                           \
@@ -116,7 +125,11 @@ enum ochi_cmd_enum
 #define OQ_SIZE (1 << 4)
 #define OQ_MASK (OQ_SIZE - 1)
 
-#define OQCMD_INIT 0
+enum oqcmd_enum
+{
+  OQCMD_INIT = 0,
+  OQCMD_RESIZE,
+};
 
 typedef struct ochi_s                           ochi_t;
 struct ochi_s
@@ -133,6 +146,9 @@ struct ochi_s
 
   c41_smt_tid_t input_tid;
   c41_smt_tid_t output_tid;
+
+  uint16_t      hn, wn;
+  uint16_t      h, w;
 
   uint8_t       orc; // return code
   uint_t        eid; // error id
@@ -166,14 +182,27 @@ static void help (ochi_t * o, c41_io_t * io_p)
   }
 }
 
+/* oq_push ******************************************************************/
+static void oq_push (ochi_t * o, uint8_t cmd)
+{
+  uint8_t i;
+  for (i = o->oq_bx; i != o->oq_ex; i = (i + 1) & OQ_MASK)
+  {
+    if (o->oq[i] == cmd) return;
+  }
+  o->oq[i] = cmd;
+  o->oq_ex = (i + 1) & OQ_MASK;
+}
+
 /* input_reader *************************************************************/
 uint8_t C41_CALL input_reader (void * arg)
 {
   ochi_t * o = arg;
   acx1_event_t e;
   uint_t c;
+  uint8_t run_chicken_run;
 
-  for (;;)
+  for (run_chicken_run = 1; run_chicken_run; )
   {
     c = acx1_read_event(&e);
     if (c)
@@ -181,10 +210,31 @@ uint8_t C41_CALL input_reader (void * arg)
       E(OE_ACX_READ, "failed reading event: $s = $i", acx1_status_str(c), c);
       return ORC_ACX_ERROR;
     }
-    if (e.km == (ACX1_ALT | 'x')) break;
+    switch (e.type)
+    {
+    case ACX1_RESIZE:
+      MLOCK();
+      o->hn = e.size.h;
+      o->wn = e.size.w;
+      oq_push(o, OQCMD_RESIZE);
+      MUNLOCK();
+      OSIGNAL();
+      break;
+    case ACX1_KEY:
+      if (e.km == (ACX1_ALT | 'x')) run_chicken_run = 0;
+      break;
+    case ACX1_ERROR:
+      E(OE_ACX_READ, "read event returned error!");
+      return ORC_ACX_ERROR;
+    default:
+      run_chicken_run = 0;
+    }
   }
 
   return 0;
+
+l_thread_error:
+  return ORC_THREAD_ERROR;
 }
 
 /* output_writer ************************************************************/
@@ -192,6 +242,8 @@ uint8_t C41_CALL output_writer (void * arg)
 {
   ochi_t * o = arg;
   uint_t c, cmd;
+  uint8_t lob[0x100];
+  ssize_t z;
 
   MLOCK();
   for (;;)
@@ -204,16 +256,25 @@ uint8_t C41_CALL output_writer (void * arg)
       switch (o->oq[o->oq_bx])
       {
       case OQCMD_INIT:
+      case OQCMD_RESIZE:
+        o->h = o->hn;
+        o->w = o->wn;
         MUNLOCK();
+        z = c41_sfmt(lob, sizeof(lob), "$Dwx$Dw", o->w, o->h);
+        A(acx1_set_cursor_mode(0));
         A(acx1_write_start());
+        A(acx1_attr(ACX1_BLACK, ACX1_GRAY, 0));
         A(acx1_clear());
+        A(acx1_attr(ACX1_DARK_GREEN, ACX1_LIGHT_YELLOW, 0));
+        A(acx1_write_pos(o->h, o->w - (int16_t) z));
+        A(acx1_write(lob, z));
         A(acx1_write_stop());
         MLOCK();
         break;
       }
     }
     if (o->exiting) break;
-    MWAIT();
+    OWAIT();
   }
 
   MUNLOCK();
@@ -382,6 +443,14 @@ static void run_ui (ochi_t * o)
 
   do
   {
+    c = acx1_get_screen_size(&o->hn, &o->wn);
+    if (c)
+    {
+      E(OE_ACX_READ, "failed reading screen size");
+      o->orc |= ORC_ACX_ERROR;
+      break;
+    }
+
     c = c41_smt_thread_create(o->smt_p, &o->input_tid, input_reader, o);
     if (c)
     {
@@ -456,7 +525,15 @@ static void run_ui (ochi_t * o)
     }
   }
 
-  if (o->acx_inited) acx1_finish();
+  if (o->acx_inited) 
+  {
+    acx1_write_start();
+    acx1_attr(ACX1_BLACK, ACX1_GRAY, 0);
+    acx1_clear();
+    acx1_write_stop();
+    acx1_set_cursor_mode(1);
+    acx1_finish();
+  }
   o->acx_inited = 0;
 }
 
