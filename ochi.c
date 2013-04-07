@@ -33,6 +33,9 @@ enum ochi_err_enum
   OE_OUTPUT_COND_SIGNAL,
   OE_OUTPUT_THREAD_CREATE,
   OE_OUTPUT_THREAD_JOIN,
+  OE_FILE_CLOSE,
+  OE_FILE_OPEN,
+  OE_FILE_NAME,
 };
 /* ename ********************************************************************/
 static char const * ename (uint_t eid)
@@ -62,6 +65,9 @@ static char const * ename (uint_t eid)
     N(OE_OUTPUT_COND_SIGNAL);
     N(OE_OUTPUT_THREAD_CREATE);
     N(OE_OUTPUT_THREAD_JOIN);
+    N(OE_FILE_CLOSE);
+    N(OE_FILE_OPEN);
+    N(OE_FILE_NAME);
   default:
     return "THE_ERROR_WHOSE_NAME_WE_DO_NOT_PRINT";
   }
@@ -73,7 +79,7 @@ enum ochi_cmd_enum
   OCMD_ARG_ERROR,
   OCMD_HELP,
   OCMD_WITH_UI,
-  OCMD_VIEW_FILE = OCMD_WITH_UI,
+  OCMD_MAIN = OCMD_WITH_UI,
   OCMD_TEST_UI,
 };
 
@@ -132,11 +138,13 @@ enum oqcmd_enum
 };
 
 typedef struct ochi_s                           ochi_t;
+
 struct ochi_s
 {
   uint_t        cmd;
-  uint_t        fn_n;
+  uint_t        fnum;
   uint8_t const * * fn_a;
+  c41_io_t * * io_pa;
 
   c41_smt_mutex_t * main_mutex_p;
   c41_smt_cond_t * out_cond_p;
@@ -155,6 +163,8 @@ struct ochi_s
   c41_u8v_t     emsg;
   c41_ma_t *    ma_p;
   c41_smt_t *   smt_p;
+  c41_fsi_t *   fsi_p;
+  c41_fspi_t *  fspi_p;
   uint8_t       acx_inited;
   uint8_t       input_thread_inited;
   uint8_t       out_thread_inited;
@@ -310,6 +320,8 @@ static void init (ochi_t * o, c41_cli_t * cli_p)
   C41_VAR_ZERO(*o);
   o->ma_p = cli_p->ma_p;
   o->smt_p = cli_p->smt_p;
+  o->fsi_p = cli_p->fsi_p;
+  o->fspi_p = cli_p->fspi_p;
   c41_u8v_init(&o->emsg, cli_p->ma_p, 20);
 
   if (!cli_p->arg_n)
@@ -373,8 +385,8 @@ static void init (ochi_t * o, c41_cli_t * cli_p)
         }
       }
     case 1:
-      if (!o->cmd) o->cmd = OCMD_VIEW_FILE;
-      o->fn_a[o->fn_n++] = cli_p->arg_a[i++];
+      if (!o->cmd) o->cmd = OCMD_MAIN;
+      o->fn_a[o->fnum++] = cli_p->arg_a[i++];
       break;
     case 2:
       switch (cli_p->arg_a[i][j])
@@ -398,7 +410,7 @@ static void init (ochi_t * o, c41_cli_t * cli_p)
     }
   }
 
-  ma_rc = C41_VAR_REALLOC(o->ma_p, o->fn_a, o->fn_n, cli_p->arg_n);
+  ma_rc = C41_VAR_REALLOC(o->ma_p, o->fn_a, o->fnum, cli_p->arg_n);
   if (ma_rc)
   {
     E(OE_MEM_ERROR, "alloc error ($s: $i)", c41_ma_status_name(ma_rc), ma_rc);
@@ -417,9 +429,9 @@ static void finish (ochi_t * o)
     if (c) E(OE_MAIN_MUTEX_DESTROY, "failed destroying mutex: $i", c);
   }
 
-  if (o->fn_n)
+  if (o->fnum)
   {
-    c = C41_VAR_FREE(o->ma_p, o->fn_a, o->fn_n);
+    c = C41_VAR_FREE(o->ma_p, o->fn_a, o->fnum);
     if (c) E(OE_MEM_ERROR, "failed freeing file names: $s = $i",
              c41_ma_status_name(c), c);
   }
@@ -525,7 +537,7 @@ static void run_ui (ochi_t * o)
     }
   }
 
-  if (o->acx_inited) 
+  if (o->acx_inited)
   {
     acx1_write_start();
     acx1_attr(ACX1_BLACK, ACX1_GRAY, 0);
@@ -541,6 +553,78 @@ static void run_ui (ochi_t * o)
 static void test_ui (ochi_t * o)
 {
   run_ui(o);
+}
+
+/* cmd_main *****************************************************************/
+static void cmd_main (ochi_t * o)
+{
+  uint_t i, inc, ma_rc, io_rc, fsi_rc;
+  c41_u8v_t path;
+  ssize_t z;
+
+  ma_rc = C41_VAR_ALLOCZ(o->ma_p, o->io_pa, o->fnum);
+  if (ma_rc)
+  {
+    E(OE_MEM_ERROR, "failed allocating io table: $i", ma_rc);
+    o->orc |= ORC_MEM_ERROR;
+    return;
+  }
+
+  c41_u8v_init(&path, o->ma_p, 16);
+  for (i = 0; i < o->fnum; i += inc)
+  {
+    path.n = 0;
+    z = o->fspi_p->fsp_from_utf8(path.a, path.m, o->fn_a[i], 
+                                 C41_STR_LEN(o->fn_a[i]));
+    if (z < 0)
+    {
+      E(OE_FILE_NAME, "bad file name '$s'", o->fn_a[i]);
+      o->orc |= ORC_FILE_ERROR;
+      break;
+    }
+    if (z > path.m)
+    {
+      ma_rc = c41_u8v_extend(&path, z);
+      if (ma_rc)
+      {
+        E(OE_MEM_ERROR, "failed allocating path for '$s'", o->fn_a[i]);
+        o->orc |= ORC_MEM_ERROR;
+        break;
+      }
+      inc = 0;
+      continue;
+    }
+    inc = 1;
+    fsi_rc = c41_file_open(o->fsi_p, &o->io_pa[i], path.a, z, 
+                      C41_FSI_EXF_OPEN | C41_FSI_NEWF_REJECT | C41_FSI_READ);
+    if (fsi_rc)
+    {
+      E(OE_FILE_OPEN, "file open failed for '$s': $s = $i",
+        o->fn_a[i], c41_fsi_status_name(fsi_rc), fsi_rc);
+      o->orc |= ORC_FILE_ERROR;
+    }
+  }
+
+  ma_rc = c41_u8v_free(&path);
+  if (ma_rc)
+  {
+    E(OE_MEM_ERROR, "failed freeing path array");
+    o->orc |= ORC_MEM_ERROR;
+  }
+
+  if (!o->orc) run_ui(o);
+
+  for (i = 0; i < o->fnum; ++i)
+  {
+    if (!o->io_pa[i]) continue;
+
+    io_rc = c41_io_close(o->io_pa[i]);
+    if (io_rc)
+    {
+      E(OE_FILE_CLOSE, "error closing file '$s'", o->fn_a[i]);
+    }
+  }
+  ma_rc = C41_VAR_FREE(o->ma_p, o->io_pa, o->fnum);
 }
 
 /* hmain ********************************************************************/
@@ -562,6 +646,9 @@ uint8_t C41_CALL hmain (c41_cli_t * cli_p)
     break;
   case OCMD_TEST_UI:
     test_ui(o);
+    break;
+  case OCMD_MAIN:
+    cmd_main(o);
     break;
   default:
     E(OE_NO_CODE, "command $i not implemented", o->cmd);
