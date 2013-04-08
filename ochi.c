@@ -2,12 +2,16 @@
 #include <hbs1.h>
 #include <acx1.h>
 
+#define MIN_WIDTH               40
+#define MIN_HEIGHT              10
+
 // ochi return code
 #define ORC_ACX_ERROR           0x01
 #define ORC_FILE_ERROR          0x02
 #define ORC_MEM_ERROR           0x04
 #define ORC_REPORT_ERROR        0x08 // error reporting error
 #define ORC_THREAD_ERROR        0x10
+#define ORC_CLI_ERROR           0x20
 
 enum ochi_err_enum
 {
@@ -17,6 +21,7 @@ enum ochi_err_enum
   OE_TWO_CMD,
   OE_MISS_SH_OPT,
   OE_UNKNOWN_OPT,
+  OE_BAD_CLI,
   OE_MEM_ERROR,
   OE_ACX_INIT,
   OE_ACX_READ,
@@ -142,9 +147,8 @@ typedef struct ochi_s                           ochi_t;
 struct ochi_s
 {
   uint_t        cmd;
-  uint_t        fnum;
-  uint8_t const * * fn_a;
-  c41_io_t * * io_pa;
+  uint8_t const * fname;
+  c41_io_t * io_p;
 
   c41_smt_mutex_t * main_mutex_p;
   c41_smt_cond_t * out_cond_p;
@@ -170,6 +174,7 @@ struct ochi_s
   uint8_t       out_thread_inited;
   uint8_t       out_cond_inited;
   uint8_t       exiting;
+  uint8_t       screen_too_small;
 };
 
 #define E(_eid, ...)                                                          \
@@ -247,13 +252,49 @@ l_thread_error:
   return ORC_THREAD_ERROR;
 }
 
+/* init_screen **************************************************************/
+uint8_t C41_CALL init_screen (ochi_t * o) // called in unlocked state
+{
+  uint8_t lob[0x100];
+  ssize_t z;
+  z = c41_sfmt(lob, sizeof(lob), "$Dwx$Dw", o->w, o->h);
+  A(acx1_set_cursor_mode(0));
+  A(acx1_write_start());
+  A(acx1_attr(ACX1_BLACK, ACX1_GRAY, 0));
+  A(acx1_clear());
+  A(acx1_attr(ACX1_DARK_GREEN, ACX1_LIGHT_YELLOW, 0));
+  A(acx1_write_pos(o->h, o->w - (int16_t) z));
+  A(acx1_write(lob, z));
+  A(acx1_write_stop());
+  return 0;
+
+l_acx_error:
+  return ORC_ACX_ERROR;
+}
+
+/* screen_too_small *********************************************************/
+uint8_t C41_CALL screen_too_small (ochi_t * o)
+{
+  static char const m[] = "SCREEN TOO SMALL";
+  A(acx1_set_cursor_mode(0));
+  A(acx1_write_start());
+  A(acx1_attr(ACX1_DARK_RED, ACX1_LIGHT_YELLOW, ACX1_BOLD));
+  A(acx1_clear());
+  A(acx1_write_pos(0, 0));
+  A(acx1_write(m, sizeof(m) - 1));
+  A(acx1_write_stop());
+  return 0;
+
+l_acx_error:
+  return ORC_ACX_ERROR;
+}
+
 /* output_writer ************************************************************/
 uint8_t C41_CALL output_writer (void * arg)
 {
   ochi_t * o = arg;
   uint_t c, cmd;
-  uint8_t lob[0x100];
-  ssize_t z;
+  uint8_t rc;
 
   MLOCK();
   for (;;)
@@ -269,16 +310,10 @@ uint8_t C41_CALL output_writer (void * arg)
       case OQCMD_RESIZE:
         o->h = o->hn;
         o->w = o->wn;
+        o->screen_too_small = (o->h < MIN_HEIGHT || o->w < MIN_WIDTH);
         MUNLOCK();
-        z = c41_sfmt(lob, sizeof(lob), "$Dwx$Dw", o->w, o->h);
-        A(acx1_set_cursor_mode(0));
-        A(acx1_write_start());
-        A(acx1_attr(ACX1_BLACK, ACX1_GRAY, 0));
-        A(acx1_clear());
-        A(acx1_attr(ACX1_DARK_GREEN, ACX1_LIGHT_YELLOW, 0));
-        A(acx1_write_pos(o->h, o->w - (int16_t) z));
-        A(acx1_write(lob, z));
-        A(acx1_write_stop());
+        rc = o->screen_too_small ? screen_too_small(o) : init_screen(o);
+        if (rc) return rc;
         MLOCK();
         break;
       }
@@ -292,7 +327,6 @@ uint8_t C41_CALL output_writer (void * arg)
   return 0;
 
 l_acx_error:
-  o->orc |= ORC_ACX_ERROR;
   return ORC_ACX_ERROR;
 l_thread_error:
   return ORC_THREAD_ERROR;
@@ -330,13 +364,6 @@ static void init (ochi_t * o, c41_cli_t * cli_p)
     return;
   }
 
-  ma_rc = C41_VAR_ALLOC(o->ma_p, o->fn_a, cli_p->arg_n);
-  if (ma_rc)
-  {
-    E(OE_MEM_ERROR, "alloc error ($s: $i)", c41_ma_status_name(ma_rc), ma_rc);
-    return;
-  }
-
   c = c41_smt_mutex_create(&o->main_mutex_p, o->smt_p, o->ma_p);
   if (c)
   {
@@ -369,6 +396,7 @@ static void init (ochi_t * o, c41_cli_t * cli_p)
           }
 
           E(OE_UNKNOWN_OPT, "unknown option '$s'", cli_p->arg_a[i] + 2);
+          o->orc |= ORC_CLI_ERROR;
           return;
         }
         else
@@ -386,7 +414,14 @@ static void init (ochi_t * o, c41_cli_t * cli_p)
       }
     case 1:
       if (!o->cmd) o->cmd = OCMD_MAIN;
-      o->fn_a[o->fnum++] = cli_p->arg_a[i++];
+      if (o->fname)
+      {
+        E(OE_BAD_CLI, "only one file name allowed");
+        o->orc |= ORC_CLI_ERROR;
+        return;
+      }
+
+      o->fname = cli_p->arg_a[i++];
       break;
     case 2:
       switch (cli_p->arg_a[i][j])
@@ -405,16 +440,10 @@ static void init (ochi_t * o, c41_cli_t * cli_p)
         break;
       default:
         E(OE_UNKNOWN_OPT, "unknown short option '$c'", cli_p->arg_a[i][j]);
+        o->orc |= ORC_CLI_ERROR;
         return;
       }
     }
-  }
-
-  ma_rc = C41_VAR_REALLOC(o->ma_p, o->fn_a, o->fnum, cli_p->arg_n);
-  if (ma_rc)
-  {
-    E(OE_MEM_ERROR, "alloc error ($s: $i)", c41_ma_status_name(ma_rc), ma_rc);
-    return;
   }
 }
 
@@ -427,13 +456,6 @@ static void finish (ochi_t * o)
   {
     c = c41_smt_mutex_destroy(o->main_mutex_p, o->smt_p, o->ma_p);
     if (c) E(OE_MAIN_MUTEX_DESTROY, "failed destroying mutex: $i", c);
-  }
-
-  if (o->fnum)
-  {
-    c = C41_VAR_FREE(o->ma_p, o->fn_a, o->fnum);
-    if (c) E(OE_MEM_ERROR, "failed freeing file names: $s = $i",
-             c41_ma_status_name(c), c);
   }
 }
 
@@ -562,47 +584,32 @@ static void cmd_main (ochi_t * o)
   c41_u8v_t path;
   ssize_t z;
 
-  ma_rc = C41_VAR_ALLOCZ(o->ma_p, o->io_pa, o->fnum);
+  c41_u8v_init(&path, o->ma_p, 16);
+  path.n = 0;
+  z = o->fspi_p->fsp_from_utf8(path.a, path.m, o->fname, 
+                               C41_STR_LEN(o->fname));
+  if (z < 0)
+  {
+    E(OE_FILE_NAME, "bad file name '$s'", o->fname);
+    o->orc |= ORC_FILE_ERROR;
+    return;
+  }
+  ma_rc = c41_u8v_extend(&path, z);
   if (ma_rc)
   {
-    E(OE_MEM_ERROR, "failed allocating io table: $i", ma_rc);
+    E(OE_MEM_ERROR, "failed allocating path for '$s'", o->fname);
     o->orc |= ORC_MEM_ERROR;
     return;
   }
-
-  c41_u8v_init(&path, o->ma_p, 16);
-  for (i = 0; i < o->fnum; i += inc)
+  z = o->fspi_p->fsp_from_utf8(path.a, path.m, o->fname, 
+                               C41_STR_LEN(o->fname));
+  fsi_rc = c41_file_open(o->fsi_p, &o->io_p, path.a, z, 
+                    C41_FSI_EXF_OPEN | C41_FSI_NEWF_REJECT | C41_FSI_READ);
+  if (fsi_rc)
   {
-    path.n = 0;
-    z = o->fspi_p->fsp_from_utf8(path.a, path.m, o->fn_a[i], 
-                                 C41_STR_LEN(o->fn_a[i]));
-    if (z < 0)
-    {
-      E(OE_FILE_NAME, "bad file name '$s'", o->fn_a[i]);
-      o->orc |= ORC_FILE_ERROR;
-      break;
-    }
-    if (z > path.m)
-    {
-      ma_rc = c41_u8v_extend(&path, z);
-      if (ma_rc)
-      {
-        E(OE_MEM_ERROR, "failed allocating path for '$s'", o->fn_a[i]);
-        o->orc |= ORC_MEM_ERROR;
-        break;
-      }
-      inc = 0;
-      continue;
-    }
-    inc = 1;
-    fsi_rc = c41_file_open(o->fsi_p, &o->io_pa[i], path.a, z, 
-                      C41_FSI_EXF_OPEN | C41_FSI_NEWF_REJECT | C41_FSI_READ);
-    if (fsi_rc)
-    {
-      E(OE_FILE_OPEN, "file open failed for '$s': $s = $i",
-        o->fn_a[i], c41_fsi_status_name(fsi_rc), fsi_rc);
-      o->orc |= ORC_FILE_ERROR;
-    }
+    E(OE_FILE_OPEN, "file open failed for '$s': $s = $i",
+      o->fname, c41_fsi_status_name(fsi_rc), fsi_rc);
+    o->orc |= ORC_FILE_ERROR;
   }
 
   ma_rc = c41_u8v_free(&path);
@@ -614,17 +621,14 @@ static void cmd_main (ochi_t * o)
 
   if (!o->orc) run_ui(o);
 
-  for (i = 0; i < o->fnum; ++i)
+  if (o->io_p)
   {
-    if (!o->io_pa[i]) continue;
-
-    io_rc = c41_io_close(o->io_pa[i]);
+    io_rc = c41_io_close(o->io_p);
     if (io_rc)
     {
-      E(OE_FILE_CLOSE, "error closing file '$s'", o->fn_a[i]);
+      E(OE_FILE_CLOSE, "error closing file '$s'", o->fname);
     }
   }
-  ma_rc = C41_VAR_FREE(o->ma_p, o->io_pa, o->fnum);
 }
 
 /* hmain ********************************************************************/
