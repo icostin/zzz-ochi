@@ -12,6 +12,7 @@
 #define ORC_REPORT_ERROR        0x08 // error reporting error
 #define ORC_THREAD_ERROR        0x10
 #define ORC_CLI_ERROR           0x20
+#define ORC_MISC_ERROR          0x40
 
 enum ochi_err_enum
 {
@@ -38,10 +39,13 @@ enum ochi_err_enum
   OE_OUTPUT_COND_SIGNAL,
   OE_OUTPUT_THREAD_CREATE,
   OE_OUTPUT_THREAD_JOIN,
+  OE_RENDER_TITLE,
   OE_FILE_CLOSE,
   OE_FILE_OPEN,
   OE_FILE_NAME,
+  OE_FILE_SEEK,
 };
+
 /* ename ********************************************************************/
 static char const * ename (uint_t eid)
 {
@@ -73,12 +77,13 @@ static char const * ename (uint_t eid)
     N(OE_FILE_CLOSE);
     N(OE_FILE_OPEN);
     N(OE_FILE_NAME);
+    N(OE_FILE_SEEK);
   default:
     return "THE_ERROR_WHOSE_NAME_WE_DO_NOT_PRINT";
   }
 }
 
-enum ochi_cmd_enum
+enum ochi_clicmd_enum
 {
   OCMD_NOP = 0,
   OCMD_ARG_ERROR,
@@ -136,19 +141,84 @@ enum ochi_cmd_enum
 #define OQ_SIZE (1 << 4)
 #define OQ_MASK (OQ_SIZE - 1)
 
-enum oqcmd_enum
+enum ochi_cmd_enum
 {
-  OQCMD_INIT = 0,
-  OQCMD_RESIZE,
+  OC_TITLE, // redraw title bar
+  OC_DATA, // redraw data panel
+  OC_MSG, // redraw msg panel
+  OC_SMALL, // screen too small
+};
+
+enum ochi_mode_enum
+{
+  OM_HEX_ABR, // ABR = ascii byte representation
+  OM_ABR,
+};
+
+enum ochi_action_enum
+{
+  OA_EXIT = 0,
+};
+
+enum ochi_style_enum
+{
+  OS_NORMAL = 0,
+  OS_OFS_SEP,
+  OS_ASC_SEP,
+  OS_OFS,
+  OS_HEX,
+  OS_HEXSEL,
+  OS_HEX_NOVAL,
+  OS_HEXSEL_NOVAL,
+  OS_HEX_WAIT,
+  OS_HEXSEL_WAIT,
+  OS_ABR_CONTROL,
+  OS_ABR_SYMBOL,
+  OS_ABR_DIGIT,
+  OS_ABR_LETTER,
+  OS_ABR_80_BF,
+  OS_ABR_C0_FF,
+  OS_TB_TEXT, // title bar - static text
+  OS_TB_EM, // text with emphasis
+  OS_TB_NAME, // title bar - name
+  OS_TB_OFS, // title bar - offset & size
+  OS__COUNT
 };
 
 typedef struct ochi_s                           ochi_t;
+
+typedef struct ochi_kap_s                       ochi_kap_t;
+struct ochi_kap_s
+{
+  uint32_t      key;
+  uint32_t      action;
+};
+
+C41_VECTOR_DECL(ochi_kapv_t, ochi_kap_t);
+C41_VECTOR_FNS(ochi_kapv_t, ochi_kap_t, kapv);
 
 struct ochi_s
 {
   uint_t        cmd;
   uint8_t const * fname;
-  c41_io_t * io_p;
+  c41_io_t *    io_p;
+  int64_t       size;
+  int64_t       page_offset;
+  uint_t        line_items;
+  uint_t        item_row;
+  uint_t        item_col;
+  uint_t        msg_lines;
+  uint_t        title_row;
+  uint_t        data_top; // line index of data area
+  uint_t        data_lines;
+  uint_t        mode;
+
+  char const *  ofs_sep;
+  char const *  abr_sep;
+  char const *  hex_sep[4];
+  ochi_kapv_t   kapv;
+
+  acx1_attr_t   attr_a[OS__COUNT];
 
   c41_smt_mutex_t * main_mutex_p;
   c41_smt_cond_t * out_cond_p;
@@ -156,10 +226,13 @@ struct ochi_s
   uint8_t       oq[OQ_SIZE];
   uint8_t       oq_bx, oq_ex;
 
+  c41_u8v_t     out_data;
+  c41_pv_t      out_lines;
+  uint16_t      out_row, out_col, out_height, out_width;
+
   c41_smt_tid_t input_tid;
   c41_smt_tid_t output_tid;
 
-  uint16_t      hn, wn;
   uint16_t      h, w;
 
   uint8_t       orc; // return code
@@ -187,6 +260,23 @@ static char const help_msg[] =
  "ochi - data viewer\n"
  ;
 
+uint8_t C41_CALL hmain (c41_cli_t * cli_p);
+static void help (ochi_t * o, c41_io_t * io_p);
+static void oq_push (ochi_t * o, uint8_t cmd);
+static uint8_t C41_CALL input_reader (void * arg);
+static uint8_t C41_CALL redraw_screen (ochi_t * o); // called in unlocked state
+static uint8_t C41_CALL screen_too_small (ochi_t * o);
+static uint8_t C41_CALL output_writer (void * arg);
+static int set_cmd (ochi_t * o, uint_t cmd);
+static void init_default_styles (ochi_t * o);
+static void init (ochi_t * o, c41_cli_t * cli_p);
+static void finish (ochi_t * o);
+static void run_ui (ochi_t * o); // should be called with mutex locked
+static void test_ui (ochi_t * o);
+static void cmd_main (ochi_t * o);
+static void C41_CALL screen_resized (ochi_t * o, uint16_t h, uint16_t w);
+static uint8_t C41_CALL render_title (ochi_t * o);
+
 /* help *********************************************************************/
 static void help (ochi_t * o, c41_io_t * io_p)
 {
@@ -210,11 +300,11 @@ static void oq_push (ochi_t * o, uint8_t cmd)
 }
 
 /* input_reader *************************************************************/
-uint8_t C41_CALL input_reader (void * arg)
+static uint8_t C41_CALL input_reader (void * arg)
 {
   ochi_t * o = arg;
   acx1_event_t e;
-  uint_t c;
+  uint_t c, i;
   uint8_t run_chicken_run;
 
   for (run_chicken_run = 1; run_chicken_run; )
@@ -229,14 +319,21 @@ uint8_t C41_CALL input_reader (void * arg)
     {
     case ACX1_RESIZE:
       MLOCK();
-      o->hn = e.size.h;
-      o->wn = e.size.w;
-      oq_push(o, OQCMD_RESIZE);
+      screen_resized(o, e.size.h, e.size.w);
       MUNLOCK();
       OSIGNAL();
       break;
     case ACX1_KEY:
-      if (e.km == (ACX1_ALT | 'x')) run_chicken_run = 0;
+      for (i = 0; i < o->kapv.n && o->kapv.a[i].key != e.km; ++i);
+      if (i >= o->kapv.n) break; // unrecognised key
+      switch (o->kapv.a[i].action)
+      {
+      case OA_EXIT:
+        run_chicken_run = 0;
+        break;
+      default:
+        break;
+      }
       break;
     case ACX1_ERROR:
       E(OE_ACX_READ, "read event returned error!");
@@ -252,8 +349,8 @@ l_thread_error:
   return ORC_THREAD_ERROR;
 }
 
-/* init_screen **************************************************************/
-uint8_t C41_CALL init_screen (ochi_t * o) // called in unlocked state
+/* redraw_screen **************************************************************/
+static uint8_t C41_CALL redraw_screen (ochi_t * o) // called in unlocked state
 {
   uint8_t lob[0x100];
   ssize_t z;
@@ -273,7 +370,7 @@ l_acx_error:
 }
 
 /* screen_too_small *********************************************************/
-uint8_t C41_CALL screen_too_small (ochi_t * o)
+static uint8_t C41_CALL screen_too_small (ochi_t * o)
 {
   static char const m[] = "SCREEN TOO SMALL";
   A(acx1_set_cursor_mode(0));
@@ -289,12 +386,49 @@ l_acx_error:
   return ORC_ACX_ERROR;
 }
 
+/* screen_resized ***********************************************************
+ * this is called in the input thread when a resize event is received
+ * it should compute all the vars for a correct screen redraw and post the
+ * relevant output commands
+ * the function should be called with the main mutex locked already
+ */
+static void C41_CALL screen_resized (ochi_t * o, uint16_t h, uint16_t w)
+{
+  o->h = h;
+  o->w = w;
+  o->screen_too_small = (o->h < MIN_HEIGHT || o->w < MIN_WIDTH);
+  if (o->screen_too_small) oq_push(o, OC_SMALL);
+  else
+  {
+    oq_push(o, OC_TITLE);
+    oq_push(o, OC_MSG);
+    oq_push(o, OC_DATA);
+  }
+}
+
+/* render_title *************************************************************/
+static uint8_t C41_CALL render_title (ochi_t * o)
+{
+  uint_t c;
+
+  o->out_data.n = 0;
+  c = c41_u8v_afmt(&o->out_data, "\a$c[ochi]\a$c (console size: $Dwx$Dw)\n",
+                   OS_TB_EM, OS_TB_TEXT, o->w, o->h);
+  if (c)
+  {
+    E(OE_RENDER_TITLE, "failed rendering title (code $i)", c);
+    return 1;
+  }
+
+  return 0;
+}
+
 /* output_writer ************************************************************/
-uint8_t C41_CALL output_writer (void * arg)
+static uint8_t C41_CALL output_writer (void * arg)
 {
   ochi_t * o = arg;
   uint_t c, cmd;
-  uint8_t rc;
+  uint8_t rc, spit;
 
   MLOCK();
   for (;;)
@@ -304,32 +438,73 @@ uint8_t C41_CALL output_writer (void * arg)
       cmd = o->oq[o->oq_bx];
       o->oq_bx = (o->oq_bx + 1) & OQ_MASK;
 
+      spit = 0;
       switch (o->oq[o->oq_bx])
       {
-      case OQCMD_INIT:
-      case OQCMD_RESIZE:
-        o->h = o->hn;
-        o->w = o->wn;
-        o->screen_too_small = (o->h < MIN_HEIGHT || o->w < MIN_WIDTH);
+      case OC_SMALL:
         MUNLOCK();
-        rc = o->screen_too_small ? screen_too_small(o) : init_screen(o);
+        rc = screen_too_small(o);
         if (rc) return rc;
         MLOCK();
         break;
+      case OC_TITLE:
+        if (render_title(o)) goto l_render_error;
+        o->out_row = o->title_row;
+        o->out_col = 1;
+        o->out_height = 1;
+        o->out_width = o->w;
+        spit = 1;
+        // MUNLOCK();
+        // A(acx1_write_pos(o->title_row, 1));
+        // A(acx1_attr(ACX1_DARK_GREEN, ACX1_LIGHT_YELLOW, 0));
+        // A(acx1_write(lob, z));
+        // A(acx1_fill(' ', o->w - (uint16_t) z));
+        // MLOCK();
+      }
+      if (spit)
+      {
+        void * * pp;
+        uint8_t * p;
+        uint8_t * q;
+        MUNLOCK();
+        o->out_lines.n = 0;
+        for (p = o->out_data.a, q = p + o->out_data.n; p != q; )
+        {
+          pp = c41_pv_append(&o->out_lines, 1);
+          if (!pp)
+          {
+            E(OE_MEM_ERROR, "failed appending to line table");
+            return ORC_MEM_ERROR;
+          }
+          *pp = p;
+          p = C41_MEM_SCAN_NOLIM(p, '\n');
+          *p++ = 0;
+        }
+
+        A(acx1_write_start());
+        A(acx1_rect((uint8_t const * const *) o->out_lines.a,
+                    o->out_row, o->out_col, o->out_height, o->out_width,
+                    o->attr_a));
+        A(acx1_write_stop());
+        MLOCK();
       }
     }
     if (o->exiting) break;
     OWAIT();
   }
-
   MUNLOCK();
 
   return 0;
 
+l_render_error:
+  MUNLOCK();
+  return ORC_MISC_ERROR;
 l_acx_error:
   return ORC_ACX_ERROR;
 l_thread_error:
   return ORC_THREAD_ERROR;
+l_mem_error:
+  return ORC_MEM_ERROR;
 }
 
 /* set_cmd ******************************************************************/
@@ -345,6 +520,60 @@ static int set_cmd (ochi_t * o, uint_t cmd)
   return 0;
 }
 
+/* init_default_styles ******************************************************/
+static void init_default_styles (ochi_t * o)
+{
+#define S(_s, _bg, _fg, _mode) (\
+  o->attr_a[_s].bg = (_bg), \
+  o->attr_a[_s].fg = (_fg), \
+  o->attr_a[OS_NORMAL].mode = (_mode))
+  S(OS_NORMAL         , ACX1_BLACK  , ACX1_LIGHT_GRAY   , ACX1_NORMAL);
+  S(OS_OFS_SEP        , ACX1_BLACK  , ACX1_LIGHT_GRAY   , ACX1_NORMAL);
+  S(OS_HEX            , ACX1_BLACK  , ACX1_LIGHT_GRAY   , ACX1_NORMAL);
+  S(OS_HEXSEL         , ACX1_BLACK  , ACX1_LIGHT_GRAY   , ACX1_NORMAL);
+  S(OS_HEX_NOVAL      , ACX1_BLACK  , ACX1_LIGHT_GRAY   , ACX1_NORMAL);
+  S(OS_HEXSEL_NOVAL   , ACX1_BLACK  , ACX1_LIGHT_GRAY   , ACX1_NORMAL);
+  S(OS_HEX_WAIT       , ACX1_BLACK  , ACX1_LIGHT_GRAY   , ACX1_NORMAL);
+  S(OS_HEXSEL_WAIT    , ACX1_BLACK  , ACX1_LIGHT_GRAY   , ACX1_NORMAL);
+  S(OS_ABR_CONTROL    , ACX1_BLACK  , ACX1_LIGHT_GRAY   , ACX1_NORMAL);
+  S(OS_ABR_SYMBOL     , ACX1_BLACK  , ACX1_LIGHT_GRAY   , ACX1_NORMAL);
+  S(OS_ABR_DIGIT      , ACX1_BLACK  , ACX1_LIGHT_GRAY   , ACX1_NORMAL);
+  S(OS_ABR_LETTER     , ACX1_BLACK  , ACX1_LIGHT_GRAY   , ACX1_NORMAL);
+  S(OS_ABR_80_BF      , ACX1_BLACK  , ACX1_LIGHT_GRAY   , ACX1_NORMAL);
+  S(OS_ABR_C0_FF      , ACX1_BLACK  , ACX1_LIGHT_GRAY   , ACX1_NORMAL);
+  S(OS_TB_TEXT        , ACX1_BLACK  , ACX1_LIGHT_GRAY   , ACX1_NORMAL);
+  S(OS_TB_NAME        , ACX1_BLACK  , ACX1_LIGHT_GRAY   , ACX1_NORMAL);
+  S(OS_TB_OFS         , ACX1_BLACK  , ACX1_LIGHT_GRAY   , ACX1_NORMAL);
+  S(OS_TB_EM          , ACX1_BLACK  , ACX1_WHITE        , ACX1_NORMAL);
+#undef S
+}
+
+/* add_key_action ***********************************************************/
+static uint_t add_key_action (ochi_t * o, uint32_t key, uint32_t action)
+{
+  ochi_kap_t * p;
+
+  p = kapv_append(&o->kapv, 1);
+  if (!p) 
+  {
+    E(OE_MEM_ERROR, "failed to append to key-action vector");
+    o->orc = ORC_MEM_ERROR;
+    return 1;
+  }
+  p->key = key;
+  p->action = action;
+  return 0;
+}
+
+/* init_default_keys ********************************************************/
+static uint_t init_default_keys (ochi_t * o)
+{
+  return 0
+    || add_key_action(o, ACX1_ALT | 'x'         , OA_EXIT)
+    || add_key_action(o, ACX1_ESC               , OA_EXIT)
+    ;
+}
+
 /* init *********************************************************************/
 static void init (ochi_t * o, c41_cli_t * cli_p)
 {
@@ -357,6 +586,24 @@ static void init (ochi_t * o, c41_cli_t * cli_p)
   o->fsi_p = cli_p->fsi_p;
   o->fspi_p = cli_p->fspi_p;
   c41_u8v_init(&o->emsg, cli_p->ma_p, 20);
+  c41_u8v_init(&o->out_data, o->ma_p, 16);
+  c41_pv_init(&o->out_lines, o->ma_p, 16);
+  kapv_init(&o->kapv, o->ma_p, 8);
+
+  o->title_row = 1;
+  o->data_top = 2;
+  o->msg_lines = 5;
+  o->mode = OM_HEX_ABR;
+  o->line_items = 0x40;
+  o->ofs_sep = ": ";
+  o->abr_sep = "  ";
+  o->hex_sep[0] = " ";
+  o->hex_sep[1] = " ";
+  o->hex_sep[2] = "  ";
+  o->hex_sep[3] = "  ";
+
+  init_default_styles(o);
+  if (init_default_keys(o)) return;
 
   if (!cli_p->arg_n)
   {
@@ -464,6 +711,7 @@ static void run_ui (ochi_t * o)
 {
   uint_t c;
   int tc;
+  uint16_t h, w;
 
   c = acx1_init();
   if (c)
@@ -477,10 +725,17 @@ static void run_ui (ochi_t * o)
 
   do
   {
-    c = acx1_get_screen_size(&o->hn, &o->wn);
+    c = acx1_get_screen_size(&h, &w);
     if (c)
     {
       E(OE_ACX_READ, "failed reading screen size");
+      o->orc |= ORC_ACX_ERROR;
+      break;
+    }
+    c = acx1_set_cursor_mode(0);
+    if (c)
+    {
+      E(OE_ACX_READ, "failed hiding cursor");
       o->orc |= ORC_ACX_ERROR;
       break;
     }
@@ -502,9 +757,6 @@ static void run_ui (ochi_t * o)
     }
     o->out_cond_inited = 1;
 
-    o->oq[0] = OQCMD_INIT;
-    o->oq_ex = 1;
-
     c = c41_smt_thread_create(o->smt_p, &o->output_tid, output_writer, o);
     if (c)
     {
@@ -513,10 +765,17 @@ static void run_ui (ochi_t * o)
     }
     o->out_thread_inited = 1;
 
+    screen_resized(o, h, w);
+
+    c = c41_smt_mutex_unlock(o->smt_p, o->main_mutex_p);
+    if (c) {
+      E(OE_MAIN_MUTEX_LOCK, "main mutex lock error: $i", c);
+      o->orc |= ORC_THREAD_ERROR;
+    }
   }
   while (0);
 
-  if (o->input_thread_inited)
+  if (o->input_thread_inited && !o->orc)
   {
     tc = c41_smt_thread_join(o->smt_p, o->input_tid);
     if (tc < 0)
@@ -584,9 +843,10 @@ static void cmd_main (ochi_t * o)
   c41_u8v_t path;
   ssize_t z;
 
+  MLOCK();
   c41_u8v_init(&path, o->ma_p, 16);
   path.n = 0;
-  z = o->fspi_p->fsp_from_utf8(path.a, path.m, o->fname, 
+  z = o->fspi_p->fsp_from_utf8(path.a, path.m, o->fname,
                                C41_STR_LEN(o->fname));
   if (z < 0)
   {
@@ -601,9 +861,9 @@ static void cmd_main (ochi_t * o)
     o->orc |= ORC_MEM_ERROR;
     return;
   }
-  z = o->fspi_p->fsp_from_utf8(path.a, path.m, o->fname, 
+  z = o->fspi_p->fsp_from_utf8(path.a, path.m, o->fname,
                                C41_STR_LEN(o->fname));
-  fsi_rc = c41_file_open(o->fsi_p, &o->io_p, path.a, z, 
+  fsi_rc = c41_file_open(o->fsi_p, &o->io_p, path.a, z,
                     C41_FSI_EXF_OPEN | C41_FSI_NEWF_REJECT | C41_FSI_READ);
   if (fsi_rc)
   {
@@ -619,7 +879,18 @@ static void cmd_main (ochi_t * o)
     o->orc |= ORC_MEM_ERROR;
   }
 
-  if (!o->orc) run_ui(o);
+  fsi_rc = c41_io_get_size(o->io_p);
+  if (fsi_rc)
+  {
+    E(OE_FILE_SEEK, "file seek error $s = $i",
+      c41_fsi_status_name(fsi_rc), fsi_rc);
+    o->orc |= ORC_FILE_ERROR;
+  }
+
+  if (!o->orc)
+  {
+    run_ui(o);
+  }
 
   if (o->io_p)
   {
@@ -629,6 +900,10 @@ static void cmd_main (ochi_t * o)
       E(OE_FILE_CLOSE, "error closing file '$s'", o->fname);
     }
   }
+  return;
+
+l_thread_error:
+  o->orc |= ORC_THREAD_ERROR;
 }
 
 /* hmain ********************************************************************/
