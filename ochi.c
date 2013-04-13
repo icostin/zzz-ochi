@@ -1,3 +1,4 @@
+#include <stdio.h>
 #include <c41.h>
 #include <hbs1.h>
 #include <acx1.h>
@@ -94,21 +95,27 @@ enum ochi_clicmd_enum
 };
 
 #define MLOCK() do { uint_t c;                                  \
+    /*printf("locking... (line %d)\n", __LINE__);*/ \
     c = c41_smt_mutex_lock(o->smt_p, o->main_mutex_p);          \
     if (c) {                                                    \
+      /*printf("lock error (line %d)...\n", __LINE__);*/ \
       E(OE_MAIN_MUTEX_LOCK, "main mutex lock error: $i", c);    \
       o->orc |= ORC_THREAD_ERROR;                               \
       goto l_thread_error;                                      \
     }                                                           \
+    /*printf("locked (line %d)\n", __LINE__);*/ \
   } while (0)
 
 #define MUNLOCK() do { uint_t c;                                \
+    /*printf("unlocking (line %d)...\n", __LINE__);*/ \
     c = c41_smt_mutex_unlock(o->smt_p, o->main_mutex_p);        \
     if (c) {                                                    \
+      /*printf("unlock error (line %d)...\n", __LINE__);*/ \
       E(OE_MAIN_MUTEX_UNLOCK, "main mutex unlock error: $i", c);\
       o->orc |= ORC_THREAD_ERROR;                               \
       goto l_thread_error;                                      \
     }                                                           \
+    /*printf("unlocked (line %d)...\n", __LINE__);*/ \
   } while (0)
 
 #define OWAIT() do { uint_t c;                                  \
@@ -211,7 +218,7 @@ struct ochi_s
   uint_t        msg_lines;
   uint_t        title_row;
   uint_t        data_top; // line index of data area
-  uint_t        data_lines;
+  uint_t        data_rows;
   uint_t        mode;
 
   char const *  ofs_sep;
@@ -236,6 +243,7 @@ struct ochi_s
 
   uint16_t      h, w;
 
+  char          ofs_fmt[8];
   uint8_t       orc; // return code
   uint_t        eid; // error id
   c41_u8v_t     emsg;
@@ -277,6 +285,7 @@ static void test_ui (ochi_t * o);
 static void cmd_main (ochi_t * o);
 static void C41_CALL screen_resized (ochi_t * o, uint16_t h, uint16_t w);
 static uint8_t C41_CALL render_title (ochi_t * o);
+static void prepare_offset_format (ochi_t * o);
 
 /* help *********************************************************************/
 static void help (ochi_t * o, c41_io_t * io_p)
@@ -348,6 +357,23 @@ static uint8_t C41_CALL input_reader (void * arg)
 
 l_thread_error:
   return ORC_THREAD_ERROR;
+}
+
+/* render_cached_data *******************************************************/
+static uint8_t C41_CALL render_cached_data (ochi_t * o)
+{
+  uint_t c, i;
+  o->out_data.n = 0;
+  for (i = 0; i < o->data_rows; ++i)
+  {
+    c = c41_u8v_afmt(&o->out_data, "--\n");
+    if (c) 
+    {
+      E(OE_RENDER_TITLE, "failed rendering data (code $i)", c);
+      return 1;
+    }
+  }
+  return 0;
 }
 
 /* redraw_screen **************************************************************/
@@ -459,6 +485,13 @@ static uint8_t C41_CALL output_writer (void * arg)
         spit = 1;
         break;
       case OC_CACHE_DATA:
+        break;
+        if (render_cached_data(o)) goto l_render_error;
+        o->out_row = o->data_top;
+        o->out_col = 1;
+        o->out_height = o->data_rows;
+        o->out_width = o->w;
+        spit = 1;
         break;
       case OC_DATA:
         break;
@@ -727,6 +760,7 @@ static void run_ui (ochi_t * o)
 
   do
   {
+    MLOCK();
     c = acx1_get_screen_size(&h, &w);
     if (c)
     {
@@ -753,8 +787,8 @@ static void run_ui (ochi_t * o)
     c = c41_smt_cond_create(&o->out_cond_p, o->smt_p, o->ma_p);
     if (c)
     {
-      E(OE_OUTPUT_COND_CREATE, "failed creating output condition variable $i",
-        c);
+      E(OE_OUTPUT_COND_CREATE, 
+        "failed creating output condition variable $i", c);
       break;
     }
     o->out_cond_inited = 1;
@@ -769,11 +803,13 @@ static void run_ui (ochi_t * o)
 
     screen_resized(o, h, w);
 
+    printf("unlocking (line %d)...\n", __LINE__);
     c = c41_smt_mutex_unlock(o->smt_p, o->main_mutex_p);
     if (c) {
-      E(OE_MAIN_MUTEX_LOCK, "main mutex lock error: $i", c);
+      E(OE_MAIN_MUTEX_UNLOCK, "main mutex unlock error: $i", c);
       o->orc |= ORC_THREAD_ERROR;
     }
+    printf("unlocked (line %d)...\n", __LINE__); 
   }
   while (0);
 
@@ -786,6 +822,11 @@ static void run_ui (ochi_t * o)
       o->orc |= ORC_THREAD_ERROR;
     }
     else o->orc |= tc;
+    // c = c41_smt_mutex_lock(o->smt_p, o->main_mutex_p);
+    // if (c) {
+    //   E(OE_MAIN_MUTEX_LOCK, "main mutex lock error: $i", c);
+    //   o->orc |= ORC_THREAD_ERROR;
+    // }
   }
 
   o->exiting = 1;
@@ -830,6 +871,9 @@ static void run_ui (ochi_t * o)
     acx1_finish();
   }
   o->acx_inited = 0;
+  return;
+l_thread_error:
+  o->orc |= ORC_THREAD_ERROR;
 }
 
 /* test_ui ******************************************************************/
@@ -845,7 +889,6 @@ static void cmd_main (ochi_t * o)
   c41_u8v_t path;
   ssize_t z;
 
-  MLOCK();
   c41_u8v_init(&path, o->ma_p, 16);
   path.n = 0;
   z = o->fspi_p->fsp_from_utf8(path.a, path.m, o->fname,
@@ -873,7 +916,6 @@ static void cmd_main (ochi_t * o)
       o->fname, c41_fsi_status_name(fsi_rc), fsi_rc);
     o->orc |= ORC_FILE_ERROR;
   }
-
   ma_rc = c41_u8v_free(&path);
   if (ma_rc)
   {
@@ -881,12 +923,16 @@ static void cmd_main (ochi_t * o)
     o->orc |= ORC_MEM_ERROR;
   }
 
-  fsi_rc = c41_io_get_size(o->io_p);
-  if (fsi_rc)
+  if (o->io_p)
   {
-    E(OE_FILE_SEEK, "file seek error $s = $i",
-      c41_fsi_status_name(fsi_rc), fsi_rc);
-    o->orc |= ORC_FILE_ERROR;
+    fsi_rc = c41_io_get_size(o->io_p);
+    if (fsi_rc)
+    {
+      E(OE_FILE_SEEK, "file seek error $s = $i",
+        c41_fsi_status_name(fsi_rc), fsi_rc);
+      o->orc |= ORC_FILE_ERROR;
+    }
+    prepare_offset_format(o);
   }
 
   if (!o->orc)
@@ -902,10 +948,16 @@ static void cmd_main (ochi_t * o)
       E(OE_FILE_CLOSE, "error closing file '$s'", o->fname);
     }
   }
-  return;
+}
 
-l_thread_error:
-  o->orc |= ORC_THREAD_ERROR;
+/* prepare_offset_format ****************************************************/
+static void prepare_offset_format (ochi_t * o)
+{
+  uint_t i;
+  uint64_t l = o->io_p->size + 0x10000;
+
+  for (i = 4; i < 16 && l <= (1 << (i * 4)); ++i);
+  c41_sfmt(o->ofs_fmt, sizeof(o->ofs_fmt), "$$+$iHG4q", i);
 }
 
 /* hmain ********************************************************************/
@@ -949,3 +1001,4 @@ uint8_t C41_CALL hmain (c41_cli_t * cli_p)
   return os.orc;
 }
 
+/* vim: set sw=2 sts=2: */

@@ -11,7 +11,7 @@ test: ochi
 	./ochi ochi
 
 clean:
-	rm ochi
+	-rm ochi
 
 install: ochi
 	mkdir -p $(PREFIX_DIR)/bin
