@@ -6,6 +6,9 @@
 #define MIN_WIDTH               40
 #define MIN_HEIGHT              10
 
+#define OV_UNKNOWN              (-1)
+#define OV_NODATA               (-2)
+
 // ochi return code
 #define ORC_ACX_ERROR           0x01
 #define ORC_FILE_ERROR          0x02
@@ -41,6 +44,7 @@ enum ochi_err_enum
   OE_OUTPUT_THREAD_CREATE,
   OE_OUTPUT_THREAD_JOIN,
   OE_RENDER_TITLE,
+  OE_RENDER_DATA,
   OE_FILE_CLOSE,
   OE_FILE_OPEN,
   OE_FILE_NAME,
@@ -79,6 +83,8 @@ static char const * ename (uint_t eid)
     N(OE_FILE_OPEN);
     N(OE_FILE_NAME);
     N(OE_FILE_SEEK);
+    N(OE_RENDER_DATA);
+    N(OE_RENDER_TITLE);
   default:
     return "THE_ERROR_WHOSE_NAME_WE_DO_NOT_PRINT";
   }
@@ -144,6 +150,8 @@ enum ochi_clicmd_enum
     } \
   } while (0)
 
+#define O(...) do { uint_t c; c = c41_u8v_afmt(&o->out_data, __VA_ARGS__); \
+  if (c) { E(OE_RENDER_DATA, "failed (code $i)", c); return 1; } } while (0)
 
 #define OQ_SIZE (1 << 4)
 #define OQ_MASK (OQ_SIZE - 1)
@@ -172,14 +180,24 @@ enum ochi_style_enum
 {
   OS_NORMAL = 0,
   OS_OFS_SEP,
+  OS_HEX_SEP,
   OS_ASC_SEP,
   OS_OFS,
-  OS_HEX,
-  OS_HEXSEL,
-  OS_HEX_NOVAL,
-  OS_HEXSEL_NOVAL,
-  OS_HEX_WAIT,
-  OS_HEXSEL_WAIT,
+  OS_NHEX, // normal
+  OS_SHEX, // selection
+  OS_HHEX, // highlight (search matches)
+  OS_DHEX, // directional highlight (row/column with cursor)
+  OS_CHEX, // cursor
+  OS_NHEX_NODATA,
+  OS_SHEX_NODATA,
+  OS_HHEX_NODATA,
+  OS_DHEX_NODATA,
+  OS_CHEX_NODATA,
+  OS_NHEX_UNK,
+  OS_SHEX_UNK,
+  OS_HHEX_UNK,
+  OS_DHEX_UNK,
+  OS_CHEX_UNK,
   OS_ABR_CONTROL,
   OS_ABR_SYMBOL,
   OS_ABR_DIGIT,
@@ -215,8 +233,7 @@ struct ochi_s
   uint_t        line_items;
   uint_t        item_row;
   uint_t        item_col;
-  uint_t        msg_lines;
-  uint_t        title_row;
+  uint_t        msg_rows;
   uint_t        data_top; // line index of data area
   uint_t        data_rows;
   uint_t        mode;
@@ -243,7 +260,7 @@ struct ochi_s
 
   uint16_t      h, w;
 
-  char          ofs_fmt[8];
+  char          ofs_fmt[16];
   uint8_t       orc; // return code
   uint_t        eid; // error id
   c41_u8v_t     emsg;
@@ -359,24 +376,69 @@ l_thread_error:
   return ORC_THREAD_ERROR;
 }
 
+/* cached_byte **************************************************************/
+static int C41_CALL cached_byte (ochi_t * o, int64_t ofs)
+{
+  if (ofs < 0 || ofs >= o->io_p->size) return OV_NODATA;
+  return OV_UNKNOWN;
+}
+
 /* render_cached_data *******************************************************/
 static uint8_t C41_CALL render_cached_data (ochi_t * o)
 {
-  uint_t c, i;
+  uint_t c, i, j, k, sty;
+  int v;
+
   o->out_data.n = 0;
   for (i = 0; i < o->data_rows; ++i)
   {
-    c = c41_u8v_afmt(&o->out_data, "--\n");
-    if (c) 
+    O("\a$c", OS_OFS);
+    O(o->ofs_fmt, o->offset + i * o->line_items);
+    O("\a$c$s", OS_OFS_SEP, o->ofs_sep);
+
+    for (j = 0; j < o->line_items; ++j)
     {
-      E(OE_RENDER_TITLE, "failed rendering data (code $i)", c);
-      return 1;
+      if (j)
+      {
+        // put separator between hex
+        for (k = 3; k > 0 && (((1 << k) - 1) & j); --k);
+        O("\a$c$s", OS_HEX_SEP, o->hex_sep[k]);
+      }
+
+      v = cached_byte(o, o->offset + i * o->line_items + j);
+
+      sty = OS_NHEX;
+      if (i == o->item_row || j == o->item_col) sty = OS_DHEX;
+      if (i == o->item_row && j == o->item_col) sty = OS_CHEX;
+
+      if (v < 0)
+      {
+        if (v == OV_UNKNOWN)
+        {
+          sty += OS_NHEX_UNK - OS_NHEX;
+          v = '?';
+        }
+        else
+        {
+          sty += OS_NHEX_NODATA - OS_NHEX;
+          v = '-';
+        }
+        O("\a$c$c$c", sty, v, v);
+      }
+      else
+      {
+        O("\a$c$U.2Hb", sty, v);
+      }
+
+
     }
+
+    O("\n");
   }
   return 0;
 }
 
-/* redraw_screen **************************************************************/
+/* redraw_screen ************************************************************/
 static uint8_t C41_CALL redraw_screen (ochi_t * o) // called in unlocked state
 {
   uint8_t lob[0x100];
@@ -427,6 +489,9 @@ static void C41_CALL screen_resized (ochi_t * o, uint16_t h, uint16_t w)
   if (o->screen_too_small) oq_push(o, OC_SMALL);
   else
   {
+    if (o->msg_rows > h - 3) o->msg_rows = h - 3;
+    o->data_top = 2;
+    o->data_rows = h - 1 - o->msg_rows;
     oq_push(o, OC_TITLE);
     oq_push(o, OC_MSG);
     oq_push(o, OC_CACHE_DATA);
@@ -478,14 +543,13 @@ static uint8_t C41_CALL output_writer (void * arg)
         break;
       case OC_TITLE:
         if (render_title(o)) goto l_render_error;
-        o->out_row = o->title_row;
+        o->out_row = 1;
         o->out_col = 1;
         o->out_height = 1;
         o->out_width = o->w;
         spit = 1;
         break;
       case OC_CACHE_DATA:
-        break;
         if (render_cached_data(o)) goto l_render_error;
         o->out_row = o->data_top;
         o->out_col = 1;
@@ -562,24 +626,36 @@ static void init_default_styles (ochi_t * o)
   o->attr_a[_s].bg = (_bg), \
   o->attr_a[_s].fg = (_fg), \
   o->attr_a[OS_NORMAL].mode = (_mode))
-  S(OS_NORMAL         , ACX1_BLACK  , ACX1_LIGHT_GRAY   , ACX1_NORMAL);
-  S(OS_OFS_SEP        , ACX1_BLACK  , ACX1_LIGHT_GRAY   , ACX1_NORMAL);
-  S(OS_HEX            , ACX1_BLACK  , ACX1_LIGHT_GRAY   , ACX1_NORMAL);
-  S(OS_HEXSEL         , ACX1_BLACK  , ACX1_LIGHT_GRAY   , ACX1_NORMAL);
-  S(OS_HEX_NOVAL      , ACX1_BLACK  , ACX1_LIGHT_GRAY   , ACX1_NORMAL);
-  S(OS_HEXSEL_NOVAL   , ACX1_BLACK  , ACX1_LIGHT_GRAY   , ACX1_NORMAL);
-  S(OS_HEX_WAIT       , ACX1_BLACK  , ACX1_LIGHT_GRAY   , ACX1_NORMAL);
-  S(OS_HEXSEL_WAIT    , ACX1_BLACK  , ACX1_LIGHT_GRAY   , ACX1_NORMAL);
-  S(OS_ABR_CONTROL    , ACX1_BLACK  , ACX1_LIGHT_GRAY   , ACX1_NORMAL);
-  S(OS_ABR_SYMBOL     , ACX1_BLACK  , ACX1_LIGHT_GRAY   , ACX1_NORMAL);
-  S(OS_ABR_DIGIT      , ACX1_BLACK  , ACX1_LIGHT_GRAY   , ACX1_NORMAL);
-  S(OS_ABR_LETTER     , ACX1_BLACK  , ACX1_LIGHT_GRAY   , ACX1_NORMAL);
-  S(OS_ABR_80_BF      , ACX1_BLACK  , ACX1_LIGHT_GRAY   , ACX1_NORMAL);
-  S(OS_ABR_C0_FF      , ACX1_BLACK  , ACX1_LIGHT_GRAY   , ACX1_NORMAL);
-  S(OS_TB_TEXT        , ACX1_BLACK  , ACX1_LIGHT_GRAY   , ACX1_NORMAL);
-  S(OS_TB_NAME        , ACX1_BLACK  , ACX1_LIGHT_GRAY   , ACX1_NORMAL);
-  S(OS_TB_OFS         , ACX1_BLACK  , ACX1_LIGHT_GRAY   , ACX1_NORMAL);
-  S(OS_TB_EM          , ACX1_BLACK  , ACX1_WHITE        , ACX1_NORMAL);
+  S(OS_NORMAL, ACX1_BLACK, ACX1_LIGHT_GRAY, ACX1_NORMAL);
+  S(OS_OFS_SEP, ACX1_BLACK, ACX1_LIGHT_GRAY, ACX1_NORMAL);
+  S(OS_HEX_SEP, ACX1_BLACK, ACX1_LIGHT_GRAY, ACX1_NORMAL);
+  S(OS_ASC_SEP, ACX1_BLACK, ACX1_LIGHT_GRAY, ACX1_NORMAL);
+  S(OS_OFS, ACX1_BLACK, ACX1_LIGHT_GRAY, ACX1_NORMAL);
+  S(OS_NHEX, ACX1_BLACK, ACX1_LIGHT_GRAY, ACX1_NORMAL);
+  S(OS_SHEX, ACX1_BLACK, ACX1_LIGHT_GRAY, ACX1_NORMAL);
+  S(OS_HHEX, ACX1_BLACK, ACX1_LIGHT_GRAY, ACX1_NORMAL);
+  S(OS_DHEX, ACX1_BLACK, ACX1_LIGHT_GRAY, ACX1_NORMAL);
+  S(OS_CHEX, ACX1_BLACK, ACX1_LIGHT_GRAY, ACX1_NORMAL);
+  S(OS_NHEX_NODATA, ACX1_BLACK, ACX1_LIGHT_GRAY, ACX1_NORMAL);
+  S(OS_SHEX_NODATA, ACX1_BLACK, ACX1_LIGHT_GRAY, ACX1_NORMAL);
+  S(OS_HHEX_NODATA, ACX1_BLACK, ACX1_LIGHT_GRAY, ACX1_NORMAL);
+  S(OS_DHEX_NODATA, ACX1_BLACK, ACX1_LIGHT_GRAY, ACX1_NORMAL);
+  S(OS_CHEX_NODATA, ACX1_BLACK, ACX1_LIGHT_GRAY, ACX1_NORMAL);
+  S(OS_NHEX_UNK, ACX1_BLACK, ACX1_LIGHT_GRAY, ACX1_NORMAL);
+  S(OS_SHEX_UNK, ACX1_BLACK, ACX1_LIGHT_GRAY, ACX1_NORMAL);
+  S(OS_HHEX_UNK, ACX1_BLACK, ACX1_LIGHT_GRAY, ACX1_NORMAL);
+  S(OS_DHEX_UNK, ACX1_BLACK, ACX1_LIGHT_GRAY, ACX1_NORMAL);
+  S(OS_CHEX_UNK, ACX1_BLACK, ACX1_LIGHT_GRAY, ACX1_NORMAL);
+  S(OS_ABR_CONTROL, ACX1_BLACK, ACX1_LIGHT_GRAY, ACX1_NORMAL);
+  S(OS_ABR_SYMBOL, ACX1_BLACK, ACX1_LIGHT_GRAY, ACX1_NORMAL);
+  S(OS_ABR_DIGIT, ACX1_BLACK, ACX1_LIGHT_GRAY, ACX1_NORMAL);
+  S(OS_ABR_LETTER, ACX1_BLACK, ACX1_LIGHT_GRAY, ACX1_NORMAL);
+  S(OS_ABR_80_BF, ACX1_BLACK, ACX1_LIGHT_GRAY, ACX1_NORMAL);
+  S(OS_ABR_C0_FF, ACX1_BLACK, ACX1_LIGHT_GRAY, ACX1_NORMAL);
+  S(OS_TB_TEXT, ACX1_BLACK, ACX1_LIGHT_GRAY, ACX1_NORMAL);
+  S(OS_TB_NAME, ACX1_BLACK, ACX1_LIGHT_GRAY, ACX1_NORMAL);
+  S(OS_TB_OFS, ACX1_BLACK, ACX1_LIGHT_GRAY, ACX1_NORMAL);
+  S(OS_TB_EM, ACX1_BLACK, ACX1_WHITE, ACX1_NORMAL);
 #undef S
 }
 
@@ -606,6 +682,7 @@ static uint_t init_default_keys (ochi_t * o)
   return 0
     || add_key_action(o, ACX1_ALT | 'x'         , OA_EXIT)
     || add_key_action(o, ACX1_ESC               , OA_EXIT)
+    || add_key_action(o, 'q'                    , OA_EXIT)
     ;
 }
 
@@ -625,9 +702,8 @@ static void init (ochi_t * o, c41_cli_t * cli_p)
   c41_pv_init(&o->out_lines, o->ma_p, 16);
   kapv_init(&o->kapv, o->ma_p, 8);
 
-  o->title_row = 1;
   o->data_top = 2;
-  o->msg_lines = 5;
+  o->msg_rows = 5;
   o->mode = OM_HEX_ABR;
   o->line_items = 0x40;
   o->ofs_sep = ": ";
@@ -803,13 +879,13 @@ static void run_ui (ochi_t * o)
 
     screen_resized(o, h, w);
 
-    printf("unlocking (line %d)...\n", __LINE__);
+    //printf("unlocking (line %d)...\n", __LINE__);
     c = c41_smt_mutex_unlock(o->smt_p, o->main_mutex_p);
     if (c) {
       E(OE_MAIN_MUTEX_UNLOCK, "main mutex unlock error: $i", c);
       o->orc |= ORC_THREAD_ERROR;
     }
-    printf("unlocked (line %d)...\n", __LINE__); 
+    //printf("unlocked (line %d)...\n", __LINE__); 
   }
   while (0);
 
@@ -932,7 +1008,7 @@ static void cmd_main (ochi_t * o)
         c41_fsi_status_name(fsi_rc), fsi_rc);
       o->orc |= ORC_FILE_ERROR;
     }
-    prepare_offset_format(o);
+    else prepare_offset_format(o);
   }
 
   if (!o->orc)
@@ -957,7 +1033,8 @@ static void prepare_offset_format (ochi_t * o)
   uint64_t l = o->io_p->size + 0x10000;
 
   for (i = 4; i < 16 && l <= (1 << (i * 4)); ++i);
-  c41_sfmt(o->ofs_fmt, sizeof(o->ofs_fmt), "$$+$iHG4q", i);
+  c41_sfmt(o->ofs_fmt, sizeof(o->ofs_fmt), "$$+HG4.$iq", i);
+  //printf("fmt: %s\n", o->ofs_fmt);
 }
 
 /* hmain ********************************************************************/
