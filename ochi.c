@@ -144,6 +144,7 @@ enum ochi_clicmd_enum
 enum ochi_cmd_enum
 {
   OC_TITLE, // redraw title bar
+  OC_CACHE_DATA, // redraw data panel
   OC_DATA, // redraw data panel
   OC_MSG, // redraw msg panel
   OC_SMALL, // screen too small
@@ -202,7 +203,7 @@ struct ochi_s
   uint_t        cmd;
   uint8_t const * fname;
   c41_io_t *    io_p;
-  int64_t       size;
+  int64_t       offset;
   int64_t       page_offset;
   uint_t        line_items;
   uint_t        item_row;
@@ -402,7 +403,7 @@ static void C41_CALL screen_resized (ochi_t * o, uint16_t h, uint16_t w)
   {
     oq_push(o, OC_TITLE);
     oq_push(o, OC_MSG);
-    oq_push(o, OC_DATA);
+    oq_push(o, OC_CACHE_DATA);
   }
 }
 
@@ -412,8 +413,10 @@ static uint8_t C41_CALL render_title (ochi_t * o)
   uint_t c;
 
   o->out_data.n = 0;
-  c = c41_u8v_afmt(&o->out_data, "\a$c[ochi]\a$c (console size: $Dwx$Dw)\n",
-                   OS_TB_EM, OS_TB_TEXT, o->w, o->h);
+  c = c41_u8v_afmt(&o->out_data, 
+                   "\a$c[ochi]\a$c $s $+XG4q/$XG4q (console size: $Dwx$Dw)\n",
+                   OS_TB_EM, OS_TB_TEXT, o->fname, o->offset, o->io_p->size,
+                   o->w, o->h);
   if (c)
   {
     E(OE_RENDER_TITLE, "failed rendering title (code $i)", c);
@@ -454,12 +457,11 @@ static uint8_t C41_CALL output_writer (void * arg)
         o->out_height = 1;
         o->out_width = o->w;
         spit = 1;
-        // MUNLOCK();
-        // A(acx1_write_pos(o->title_row, 1));
-        // A(acx1_attr(ACX1_DARK_GREEN, ACX1_LIGHT_YELLOW, 0));
-        // A(acx1_write(lob, z));
-        // A(acx1_fill(' ', o->w - (uint16_t) z));
-        // MLOCK();
+        break;
+      case OC_CACHE_DATA:
+        break;
+      case OC_DATA:
+        break;
       }
       if (spit)
       {
