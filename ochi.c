@@ -1,7 +1,10 @@
 #include <stdio.h>
+#include <inttypes.h>
 #include <c41.h>
 #include <hbs1.h>
 #include <acx1.h>
+
+#define NUM_WORKERS             2
 
 #define MIN_WIDTH               40
 #define MIN_HEIGHT              10
@@ -17,88 +20,6 @@
 #define ORC_THREAD_ERROR        0x10
 #define ORC_CLI_ERROR           0x20
 #define ORC_MISC_ERROR          0x40
-
-enum ochi_err_enum
-{
-  OE_NONE = 0,
-  OE_NO_CODE,
-  OE_STDOUT_ERROR,
-  OE_TWO_CMD,
-  OE_MISS_SH_OPT,
-  OE_UNKNOWN_OPT,
-  OE_BAD_CLI,
-  OE_MEM_ERROR,
-  OE_ACX_INIT,
-  OE_ACX_READ,
-  OE_ACX_WRITE,
-  OE_INPUT_THREAD_CREATE,
-  OE_INPUT_THREAD_JOIN,
-  OE_MAIN_MUTEX_CREATE,
-  OE_MAIN_MUTEX_DESTROY,
-  OE_MAIN_MUTEX_LOCK,
-  OE_MAIN_MUTEX_UNLOCK,
-  OE_OUTPUT_COND_CREATE,
-  OE_OUTPUT_COND_DESTROY,
-  OE_OUTPUT_COND_WAIT,
-  OE_OUTPUT_COND_SIGNAL,
-  OE_OUTPUT_THREAD_CREATE,
-  OE_OUTPUT_THREAD_JOIN,
-  OE_RENDER_TITLE,
-  OE_RENDER_DATA,
-  OE_FILE_CLOSE,
-  OE_FILE_OPEN,
-  OE_FILE_NAME,
-  OE_FILE_SEEK,
-};
-
-/* ename ********************************************************************/
-static char const * ename (uint_t eid)
-{
-#define N(_x) case _x: return #_x;
-  switch (eid)
-  {
-    N(OE_NONE);
-    N(OE_NO_CODE);
-    N(OE_STDOUT_ERROR);
-    N(OE_TWO_CMD);
-    N(OE_MISS_SH_OPT);
-    N(OE_UNKNOWN_OPT);
-    N(OE_MEM_ERROR);
-    N(OE_ACX_INIT);
-    N(OE_ACX_READ);
-    N(OE_ACX_WRITE);
-    N(OE_INPUT_THREAD_CREATE);
-    N(OE_INPUT_THREAD_JOIN);
-    N(OE_MAIN_MUTEX_CREATE);
-    N(OE_MAIN_MUTEX_DESTROY);
-    N(OE_MAIN_MUTEX_LOCK);
-    N(OE_MAIN_MUTEX_UNLOCK);
-    N(OE_OUTPUT_COND_CREATE);
-    N(OE_OUTPUT_COND_DESTROY);
-    N(OE_OUTPUT_COND_WAIT);
-    N(OE_OUTPUT_COND_SIGNAL);
-    N(OE_OUTPUT_THREAD_CREATE);
-    N(OE_OUTPUT_THREAD_JOIN);
-    N(OE_FILE_CLOSE);
-    N(OE_FILE_OPEN);
-    N(OE_FILE_NAME);
-    N(OE_FILE_SEEK);
-    N(OE_RENDER_DATA);
-    N(OE_RENDER_TITLE);
-  default:
-    return "THE_ERROR_WHOSE_NAME_WE_DO_NOT_PRINT";
-  }
-}
-
-enum ochi_clicmd_enum
-{
-  OCMD_NOP = 0,
-  OCMD_ARG_ERROR,
-  OCMD_HELP,
-  OCMD_WITH_UI,
-  OCMD_MAIN = OCMD_WITH_UI,
-  OCMD_TEST_UI,
-};
 
 #define MLOCK() do { uint_t c;                                  \
     /*printf("locking... (line %d)\n", __LINE__);*/ \
@@ -142,6 +63,24 @@ enum ochi_clicmd_enum
     }                                                           \
   } while (0)
 
+#define JWAIT() do { uint_t c;                                  \
+    c = c41_smt_cond_wait(o->smt_p, o->job_cond_p, o->main_mutex_p); \
+    if (c) {                                                    \
+      E(OE_WORKER_COND_WAIT, "worker cond wait error: $i", c);  \
+      o->orc |= ORC_THREAD_ERROR;                               \
+      goto l_thread_error;                                      \
+    }                                                           \
+  } while (0)
+
+#define JSIGNAL() do { uint_t c;                                \
+    c = c41_smt_cond_signal(o->smt_p, o->job_cond_p);           \
+    if (c) {                                                    \
+      E(OE_WORKER_COND_SIGNAL, "worker cond signal error: $i", c);  \
+      o->orc |= ORC_THREAD_ERROR;                               \
+      goto l_thread_error;                                      \
+    }                                                           \
+  } while (0)
+
 #define A(_x) do { uint_t c = (_x); \
     if (c) { E(OE_ACX_WRITE, "($s) failed: $s = $i", #_x, \
                acx1_status_str(c), c); \
@@ -156,13 +95,66 @@ enum ochi_clicmd_enum
 #define OQ_SIZE (1 << 4)
 #define OQ_MASK (OQ_SIZE - 1)
 
+#define WQ_SIZE (1 << 4)
+#define WQ_MASK (WQ_SIZE - 1)
+
+
+enum ochi_err_enum
+{
+  OE_NONE = 0,
+  OE_NO_CODE,
+  OE_STDOUT_ERROR,
+  OE_TWO_CMD,
+  OE_MISS_SH_OPT,
+  OE_UNKNOWN_OPT,
+  OE_BAD_CLI,
+  OE_MEM_ERROR,
+  OE_ACX_INIT,
+  OE_ACX_READ,
+  OE_ACX_WRITE,
+  OE_INPUT_THREAD_CREATE,
+  OE_INPUT_THREAD_JOIN,
+  OE_MAIN_MUTEX_CREATE,
+  OE_MAIN_MUTEX_DESTROY,
+  OE_MAIN_MUTEX_LOCK,
+  OE_MAIN_MUTEX_UNLOCK,
+  OE_OUTPUT_COND_CREATE,
+  OE_OUTPUT_COND_DESTROY,
+  OE_OUTPUT_COND_WAIT,
+  OE_OUTPUT_COND_SIGNAL,
+  OE_OUTPUT_THREAD_CREATE,
+  OE_OUTPUT_THREAD_JOIN,
+  OE_WORKER_COND_CREATE,
+  OE_WORKER_COND_DESTROY,
+  OE_WORKER_COND_WAIT,
+  OE_WORKER_COND_SIGNAL,
+  OE_WORKER_THREAD_CREATE,
+  OE_WORKER_THREAD_JOIN,
+  OE_RENDER_TITLE,
+  OE_RENDER_DATA,
+  OE_FILE_CLOSE,
+  OE_FILE_OPEN,
+  OE_FILE_NAME,
+  OE_FILE_SEEK,
+};
+
+enum ochi_clicmd_enum
+{
+  OCMD_NOP = 0,
+  OCMD_ARG_ERROR,
+  OCMD_HELP,
+  OCMD_WITH_UI,
+  OCMD_MAIN = OCMD_WITH_UI,
+  OCMD_TEST_UI,
+};
+
 enum ochi_cmd_enum
 {
-  OC_TITLE, // redraw title bar
-  OC_CACHE_DATA, // redraw data panel
-  OC_DATA, // redraw data panel
-  OC_MSG, // redraw msg panel
-  OC_SMALL, // screen too small
+  OC_SHOW_TITLE_BAR = 1, // redraw title bar
+  OC_SHOW_DATA, // redraw data panel
+  OC_SHOW_MSG_AREA, // redraw msg panel
+  OC_SHOW_TOO_SMALL, // screen too small
+  OC_READ_DATA,
 };
 
 enum ochi_mode_enum
@@ -174,14 +166,33 @@ enum ochi_mode_enum
 enum ochi_action_enum
 {
   OA_EXIT = 0,
+  OA_CURSOR_LEFT,
+  OA_CURSOR_DOWN,
+  OA_CURSOR_UP,
+  OA_CURSOR_RIGHT,
+  OA_CURSOR_HIGH,
+  OA_CURSOR_MED,
+  OA_CURSOR_LOW,
+  OA_CURSOR_GO,
+  OA_CURSOR_END,
+  OA_CURSOR_PAGE_UP,
+  OA_CURSOR_PAGE_DOWN,
+  OA_CURSOR_BOL,
+  OA_CURSOR_EOL,
+  OA_CURSOR_PERC,
+  OA_DEC_WIDTH,
+  OA_INC_WIDTH,
+  OA_SLIDE_LEFT,
+  OA_SLIDE_RIGHT,
 };
 
 enum ochi_style_enum
 {
-  OS_NORMAL = 0,
+  OS_NORMAL0 = 0,
+  OS_NORMAL,
   OS_OFS_SEP,
   OS_HEX_SEP,
-  OS_ASC_SEP,
+  OS_ABR_SEP,
   OS_OFS,
   OS_NHEX, // normal
   OS_SHEX, // selection
@@ -204,6 +215,8 @@ enum ochi_style_enum
   OS_ABR_LETTER,
   OS_ABR_80_BF,
   OS_ABR_C0_FF,
+  OS_ABR_UNK,
+  OS_ABR_NODATA,
   OS_TB_TEXT, // title bar - static text
   OS_TB_EM, // text with emphasis
   OS_TB_NAME, // title bar - name
@@ -212,8 +225,8 @@ enum ochi_style_enum
 };
 
 typedef struct ochi_s                           ochi_t;
-
 typedef struct ochi_kap_s                       ochi_kap_t;
+
 struct ochi_kap_s
 {
   uint32_t      key;
@@ -238,6 +251,8 @@ struct ochi_s
   uint_t        data_rows;
   uint_t        mode;
 
+  c41_u8v_t     data_cache[2];
+  uint64_t      ofs_cache[2];
   char const *  ofs_sep;
   char const *  abr_sep;
   char const *  hex_sep[4];
@@ -247,9 +262,15 @@ struct ochi_s
 
   c41_smt_mutex_t * main_mutex_p;
   c41_smt_cond_t * out_cond_p;
+  c41_smt_cond_t * job_cond_p;
 
   uint8_t       oq[OQ_SIZE];
   uint8_t       oq_bx, oq_ex;
+
+  uint8_t       wq[WQ_SIZE];
+  uint8_t       wq_bx, wq_ex;
+
+  uint8_t       adcx; // active data cache index
 
   c41_u8v_t     out_data;
   c41_pv_t      out_lines;
@@ -257,6 +278,9 @@ struct ochi_s
 
   c41_smt_tid_t input_tid;
   c41_smt_tid_t output_tid;
+  c41_smt_tid_t worker_tid_a[NUM_WORKERS];
+  uint_t        worker_n; // number of inited workers
+  uint_t        workers_left;
 
   uint16_t      h, w;
 
@@ -272,6 +296,7 @@ struct ochi_s
   uint8_t       input_thread_inited;
   uint8_t       out_thread_inited;
   uint8_t       out_cond_inited;
+  uint8_t       job_cond_inited;
   uint8_t       exiting;
   uint8_t       screen_too_small;
 };
@@ -289,10 +314,12 @@ static char const help_msg[] =
 uint8_t C41_CALL hmain (c41_cli_t * cli_p);
 static void help (ochi_t * o, c41_io_t * io_p);
 static void oq_push (ochi_t * o, uint8_t cmd);
+static void wq_push (ochi_t * o, uint8_t cmd);
 static uint8_t C41_CALL input_reader (void * arg);
 static uint8_t C41_CALL redraw_screen (ochi_t * o); // called in unlocked state
 static uint8_t C41_CALL screen_too_small (ochi_t * o);
 static uint8_t C41_CALL output_writer (void * arg);
+static uint8_t C41_CALL worker (void * arg);
 static int set_cmd (ochi_t * o, uint_t cmd);
 static void init_default_styles (ochi_t * o);
 static void init (ochi_t * o, c41_cli_t * cli_p);
@@ -303,6 +330,52 @@ static void cmd_main (ochi_t * o);
 static void C41_CALL screen_resized (ochi_t * o, uint16_t h, uint16_t w);
 static uint8_t C41_CALL render_title (ochi_t * o);
 static void prepare_offset_format (ochi_t * o);
+static uint_t data_line_len (ochi_t * o, uint_t n);
+static int abr_ch (int ch);
+static int abr_style (int ch);
+static size_t extend_cache (ochi_t * o, int index, size_t len);
+static uint_t init_default_keys (ochi_t * o);
+static char const * ename (uint_t eid);
+static void move_cursor (ochi_t * o, int action);
+
+/* ename ********************************************************************/
+static char const * ename (uint_t eid)
+{
+#define N(_x) case _x: return #_x;
+  switch (eid)
+  {
+    N(OE_NONE);
+    N(OE_NO_CODE);
+    N(OE_STDOUT_ERROR);
+    N(OE_TWO_CMD);
+    N(OE_MISS_SH_OPT);
+    N(OE_UNKNOWN_OPT);
+    N(OE_MEM_ERROR);
+    N(OE_ACX_INIT);
+    N(OE_ACX_READ);
+    N(OE_ACX_WRITE);
+    N(OE_INPUT_THREAD_CREATE);
+    N(OE_INPUT_THREAD_JOIN);
+    N(OE_MAIN_MUTEX_CREATE);
+    N(OE_MAIN_MUTEX_DESTROY);
+    N(OE_MAIN_MUTEX_LOCK);
+    N(OE_MAIN_MUTEX_UNLOCK);
+    N(OE_OUTPUT_COND_CREATE);
+    N(OE_OUTPUT_COND_DESTROY);
+    N(OE_OUTPUT_COND_WAIT);
+    N(OE_OUTPUT_COND_SIGNAL);
+    N(OE_OUTPUT_THREAD_CREATE);
+    N(OE_OUTPUT_THREAD_JOIN);
+    N(OE_FILE_CLOSE);
+    N(OE_FILE_OPEN);
+    N(OE_FILE_NAME);
+    N(OE_FILE_SEEK);
+    N(OE_RENDER_DATA);
+    N(OE_RENDER_TITLE);
+  default:
+    return "THE_ERROR_WHOSE_NAME_WE_DO_NOT_PRINT";
+  }
+}
 
 /* help *********************************************************************/
 static void help (ochi_t * o, c41_io_t * io_p)
@@ -326,6 +399,118 @@ static void oq_push (ochi_t * o, uint8_t cmd)
   o->oq_ex = (i + 1) & OQ_MASK;
 }
 
+/* wq_push ******************************************************************/
+static void wq_push (ochi_t * o, uint8_t cmd)
+{
+  uint8_t i;
+  for (i = o->wq_bx; i != o->wq_ex; i = (i + 1) & WQ_MASK)
+  {
+    if (o->wq[i] == cmd) return;
+  }
+  o->wq[i] = cmd;
+  o->wq_ex = (i + 1) & WQ_MASK;
+}
+
+/* move_cursor *****************************************************/
+static void move_cursor (ochi_t * o, int action)
+{
+  int64_t new_pos;
+  int64_t page_end;
+
+  MLOCK();
+  switch (action)
+  {
+  case OA_CURSOR_LEFT:
+    new_pos = o->offset - 1;
+    break;
+  case OA_CURSOR_RIGHT:
+    new_pos = o->offset + 1;
+    break;
+  case OA_CURSOR_UP:
+    new_pos = o->offset - o->line_items;
+    break;
+  case OA_CURSOR_DOWN:
+    new_pos = o->offset + o->line_items;
+    break;
+  case OA_CURSOR_HIGH:
+    new_pos = o->page_offset;
+    break;
+  case OA_CURSOR_LOW:
+    new_pos = o->page_offset + o->line_items * (o->data_rows - 1);
+    break;
+  case OA_CURSOR_MED:
+    new_pos =  o->page_offset + o->line_items * (o->data_rows / 2);
+    break;
+  case OA_CURSOR_GO:
+    new_pos = 0;
+    break;
+  case OA_CURSOR_END:
+    new_pos = o->io_p->size - 1;
+    break;
+  case OA_CURSOR_PAGE_DOWN:
+    new_pos = o->offset + (o->data_rows - 1) * o->line_items;
+    o->page_offset += (o->data_rows - 1) * o->line_items;
+    break;
+  case OA_CURSOR_PAGE_UP:
+    new_pos = o->offset - (o->data_rows - 1) * o->line_items;
+    o->page_offset -= (o->data_rows - 1) * o->line_items;
+    break;
+  case OA_CURSOR_BOL:
+    new_pos = o->offset - o->item_col;
+    break;
+  case OA_CURSOR_EOL:
+    new_pos = o->offset - o->item_col + o->line_items - 1;
+    break;
+  case OA_CURSOR_PERC:
+    new_pos = o->io_p->size / 2;
+    break;
+  case OA_DEC_WIDTH:
+    if (o->line_items > 1) o->line_items -= 1;
+    new_pos = o->offset;
+    break;
+  case OA_INC_WIDTH:
+    if (data_line_len(o, o->line_items + 1) <= o->w)
+      o->line_items += 1;
+    new_pos = o->offset;
+    break;
+  case OA_SLIDE_LEFT:
+    new_pos = o->offset;
+    o->page_offset += 1;
+    break;
+  case OA_SLIDE_RIGHT:
+    new_pos = o->offset;
+    o->page_offset -= 1;
+    break;
+  default:
+    new_pos = o->offset;
+  }
+
+  if (new_pos < o->page_offset)
+  {
+    o->page_offset -= o->line_items * 
+      ((o->page_offset - new_pos + o->line_items - 1) / o->line_items);
+  }
+  else if (new_pos >= 
+           (page_end = o->page_offset + o->line_items * o->data_rows))
+  {
+    o->page_offset += o->line_items * 
+      ((new_pos + o->line_items - page_end) / o->line_items);
+  }
+  /* now new pos should be inside the screen */
+  o->item_row = (new_pos - o->page_offset) / o->line_items;
+  o->item_col = new_pos - o->page_offset - o->item_row * o->line_items;
+
+  if (o->offset != new_pos) oq_push(o, OC_SHOW_TITLE_BAR);
+  o->offset = new_pos;
+  
+  oq_push(o, OC_SHOW_DATA);
+  MUNLOCK();
+  OSIGNAL();
+l_thread_error:
+  o->orc |= ORC_THREAD_ERROR;
+  return;
+}
+
 /* input_reader *************************************************************/
 static uint8_t C41_CALL input_reader (void * arg)
 {
@@ -333,6 +518,7 @@ static uint8_t C41_CALL input_reader (void * arg)
   acx1_event_t e;
   uint_t c, i;
   uint8_t run_chicken_run;
+  int action;
 
   for (run_chicken_run = 1; run_chicken_run; )
   {
@@ -353,10 +539,31 @@ static uint8_t C41_CALL input_reader (void * arg)
     case ACX1_KEY:
       for (i = 0; i < o->kapv.n && o->kapv.a[i].key != e.km; ++i);
       if (i >= o->kapv.n) break; // unrecognised key
-      switch (o->kapv.a[i].action)
+      action = o->kapv.a[i].action;
+      switch (action)
       {
       case OA_EXIT:
         run_chicken_run = 0;
+        break;
+      case OA_CURSOR_LEFT:
+      case OA_CURSOR_RIGHT:
+      case OA_CURSOR_UP:
+      case OA_CURSOR_DOWN:
+      case OA_CURSOR_HIGH:
+      case OA_CURSOR_MED:
+      case OA_CURSOR_LOW:
+      case OA_CURSOR_GO:
+      case OA_CURSOR_END:
+      case OA_CURSOR_PAGE_UP:
+      case OA_CURSOR_PAGE_DOWN:
+      case OA_CURSOR_BOL:
+      case OA_CURSOR_EOL:
+      case OA_CURSOR_PERC:
+      case OA_DEC_WIDTH:
+      case OA_INC_WIDTH:
+      case OA_SLIDE_LEFT:
+      case OA_SLIDE_RIGHT:
+        move_cursor(o, action);
         break;
       default:
         break;
@@ -380,20 +587,23 @@ l_thread_error:
 static int C41_CALL cached_byte (ochi_t * o, int64_t ofs)
 {
   if (ofs < 0 || ofs >= o->io_p->size) return OV_NODATA;
-  return OV_UNKNOWN;
+  if (ofs < o->ofs_cache[o->adcx] ||
+      ofs >= o->ofs_cache[o->adcx] + o->data_cache[o->adcx].n)
+    return OV_UNKNOWN;
+  return o->data_cache[o->adcx].a[ofs - o->ofs_cache[o->adcx]];
 }
 
 /* render_cached_data *******************************************************/
 static uint8_t C41_CALL render_cached_data (ochi_t * o)
 {
   uint_t c, i, j, k, sty;
-  int v;
+  int v, gunk;
 
   o->out_data.n = 0;
-  for (i = 0; i < o->data_rows; ++i)
+  for (gunk = i = 0; i < o->data_rows; ++i)
   {
     O("\a$c", OS_OFS);
-    O(o->ofs_fmt, o->offset + i * o->line_items);
+    O(o->ofs_fmt, o->page_offset + i * o->line_items);
     O("\a$c$s", OS_OFS_SEP, o->ofs_sep);
 
     for (j = 0; j < o->line_items; ++j)
@@ -405,7 +615,7 @@ static uint8_t C41_CALL render_cached_data (ochi_t * o)
         O("\a$c$s", OS_HEX_SEP, o->hex_sep[k]);
       }
 
-      v = cached_byte(o, o->offset + i * o->line_items + j);
+      v = cached_byte(o, o->page_offset + i * o->line_items + j);
 
       sty = OS_NHEX;
       if (i == o->item_row || j == o->item_col) sty = OS_DHEX;
@@ -415,6 +625,7 @@ static uint8_t C41_CALL render_cached_data (ochi_t * o)
       {
         if (v == OV_UNKNOWN)
         {
+          gunk = 1;
           sty += OS_NHEX_UNK - OS_NHEX;
           v = '?';
         }
@@ -429,14 +640,52 @@ static uint8_t C41_CALL render_cached_data (ochi_t * o)
       {
         O("\a$c$U.2Hb", sty, v);
       }
-
-
+    }
+    O("\a$c$s", OS_ABR_SEP, o->abr_sep);
+    for (j = 0; j < o->line_items; ++j)
+    {
+      v = cached_byte(o, o->page_offset + i * o->line_items + j);
+      O("\a$c$c", abr_style(v), abr_ch(v));
     }
 
-    O("\n");
+    O("$c", 0);
   }
+  if (gunk) 
+  {
+// printf("REQUEST_READ_DATA\n");
+    wq_push(o, OC_READ_DATA);
+    JSIGNAL();
+  }
+
   return 0;
+l_thread_error:
+  return ORC_THREAD_ERROR;
 }
+
+/* abr_ch *******************************************************************/
+static int abr_ch (int ch)
+{
+  if (ch < 0) return ch == OV_UNKNOWN ? '?' : ' ';
+  if (ch == 0) return '.';
+  if (ch < 0x20) return '@' + ch;
+  if (ch < 0x7F) return ch;
+  if (ch >= 0x80) ch = 0x40 + (ch & 0x3F);
+  if (ch == 0x7F) return '~';
+  return ch;
+}
+
+/* abr_style ****************************************************************/
+static int abr_style (int ch)
+{
+  if (ch < 0) return ch == OV_UNKNOWN ? OS_ABR_UNK : OS_ABR_NODATA;
+  if (ch < 0x20 || ch == 0x7F) return OS_ABR_CONTROL;
+  if (ch >= '0' && ch <= '9') return OS_ABR_DIGIT;
+  if ((ch >= 'A' && ch <= 'Z') || (ch >= 'a' && ch <= 'z')) 
+    return OS_ABR_LETTER;
+  if (ch >= 0x80) return ch < 0xC0 ? OS_ABR_80_BF : OS_ABR_C0_FF;
+  return OS_ABR_SYMBOL;
+}
+
 
 /* redraw_screen ************************************************************/
 static uint8_t C41_CALL redraw_screen (ochi_t * o) // called in unlocked state
@@ -475,6 +724,28 @@ l_acx_error:
   return ORC_ACX_ERROR;
 }
 
+/* data_line_len ************************************************************/
+static uint_t data_line_len (ochi_t * o, uint_t n)
+{
+  uint8_t buf[0x20];
+  uint_t l, j, k;
+
+  l = c41_sfmt(buf, sizeof(buf), o->ofs_fmt, (uint64_t) 0);
+  l += C41_STR_LEN(o->ofs_sep);
+  for (j = 0; j < n; ++j)
+  {
+    if (j)
+    {
+      // put separator between hex
+      for (k = 3; k > 0 && (((1 << k) - 1) & j); --k);
+      l += C41_STR_LEN(o->hex_sep[k]);
+    }
+    l += 2;
+  }
+  l += C41_STR_LEN(o->abr_sep) + n;
+  return (l);
+}
+
 /* screen_resized ***********************************************************
  * this is called in the input thread when a resize event is received
  * it should compute all the vars for a correct screen redraw and post the
@@ -483,18 +754,29 @@ l_acx_error:
  */
 static void C41_CALL screen_resized (ochi_t * o, uint16_t h, uint16_t w)
 {
+  size_t l;
+  uint_t c;
+
   o->h = h;
   o->w = w;
   o->screen_too_small = (o->h < MIN_HEIGHT || o->w < MIN_WIDTH);
-  if (o->screen_too_small) oq_push(o, OC_SMALL);
+  if (o->screen_too_small) oq_push(o, OC_SHOW_TOO_SMALL);
   else
   {
     if (o->msg_rows > h - 3) o->msg_rows = h - 3;
     o->data_top = 2;
     o->data_rows = h - 1 - o->msg_rows;
-    oq_push(o, OC_TITLE);
-    oq_push(o, OC_MSG);
-    oq_push(o, OC_CACHE_DATA);
+
+    if (data_line_len(o, o->line_items) > w)
+    {
+      uint_t li;
+      for (li = 1; data_line_len(o, 2 << li) <= w; ++li);
+      o->line_items = 1 << li;
+    }
+
+    oq_push(o, OC_SHOW_TITLE_BAR);
+    oq_push(o, OC_SHOW_MSG_AREA);
+    oq_push(o, OC_SHOW_DATA);
   }
 }
 
@@ -504,15 +786,23 @@ static uint8_t C41_CALL render_title (ochi_t * o)
   uint_t c;
 
   o->out_data.n = 0;
+  O("\a$c", OS_TB_OFS);
+  O(o->ofs_fmt, o->offset);
+  O("\a$c/\a$c", OS_TB_TEXT, OS_TB_OFS);
+  O(o->ofs_fmt, o->io_p->size);
+  O("\a$c $s", OS_TB_TEXT, o->fname);
+  O("\a$c$c", OS_TB_TEXT, 0);
+#if 0
   c = c41_u8v_afmt(&o->out_data, 
-                   "\a$c[ochi]\a$c $s $+XG4q/$XG4q (console size: $Dwx$Dw)\n",
+                   "\a$c[ochi]\a$c $s $+XG4q/$XG4q (console size: $Dwx$Dw)$c",
                    OS_TB_EM, OS_TB_TEXT, o->fname, o->offset, o->io_p->size,
-                   o->w, o->h);
+                   o->w, o->h, 0);
   if (c)
   {
     E(OE_RENDER_TITLE, "failed rendering title (code $i)", c);
     return 1;
   }
+#endif
 
   return 0;
 }
@@ -530,18 +820,19 @@ static uint8_t C41_CALL output_writer (void * arg)
     for (; !o->exiting && o->oq_bx != o->oq_ex; )
     {
       cmd = o->oq[o->oq_bx];
+// printf("output got cmd %u\n", cmd);
       o->oq_bx = (o->oq_bx + 1) & OQ_MASK;
 
       spit = 0;
-      switch (o->oq[o->oq_bx])
+      switch (cmd)
       {
-      case OC_SMALL:
+      case OC_SHOW_TOO_SMALL:
         MUNLOCK();
         rc = screen_too_small(o);
         if (rc) return rc;
         MLOCK();
         break;
-      case OC_TITLE:
+      case OC_SHOW_TITLE_BAR:
         if (render_title(o)) goto l_render_error;
         o->out_row = 1;
         o->out_col = 1;
@@ -549,15 +840,18 @@ static uint8_t C41_CALL output_writer (void * arg)
         o->out_width = o->w;
         spit = 1;
         break;
-      case OC_CACHE_DATA:
-        if (render_cached_data(o)) goto l_render_error;
+      case OC_SHOW_DATA:
+// printf("rendering cached data...\n");
+        rc = render_cached_data(o);
+// printf("rendered cached data: %d\n", rc);
+        if (rc) { MUNLOCK(); return rc; }
         o->out_row = o->data_top;
         o->out_col = 1;
         o->out_height = o->data_rows;
         o->out_width = o->w;
         spit = 1;
         break;
-      case OC_DATA:
+      case OC_SHOW_MSG_AREA:
         break;
       }
       if (spit)
@@ -576,9 +870,14 @@ static uint8_t C41_CALL output_writer (void * arg)
             return ORC_MEM_ERROR;
           }
           *pp = p;
-          p = C41_MEM_SCAN_NOLIM(p, '\n');
-          *p++ = 0;
+          p += C41_STR_LEN(p) + 1;
         }
+        if (o->out_lines.n != o->out_height)
+        {
+          E(OE_RENDER_DATA, "ol=$z, oh=$z", o->out_lines.n, o->out_height);
+          return ORC_MISC_ERROR;
+        }
+
 
         A(acx1_write_start());
         A(acx1_rect((uint8_t const * const *) o->out_lines.a,
@@ -606,6 +905,95 @@ l_mem_error:
   return ORC_MEM_ERROR;
 }
 
+/* extend_cache *************************************************************/
+static size_t extend_cache (ochi_t * o, int index, size_t len)
+{
+  uint_t c;
+  if (o->data_cache[index].n < len)
+  {
+    c = c41_u8v_extend(&o->data_cache[index], len - o->data_cache[index].n);
+    if (c)
+    {
+      E(ORC_MEM_ERROR, "failed extending data cache to $z", len);
+      len = o->data_cache[index].m;
+    }
+  }
+  //o->data_cache[index].n = len;
+  return len;
+}
+
+/* worker *******************************************************************/
+static uint8_t C41_CALL worker (void * arg)
+{
+  ochi_t * o = arg;
+  uint_t cmd, ci, c;
+  ssize_t l, rl;
+  int sig;
+  int64_t ofs;
+
+  MLOCK();
+  for (;;)
+  {
+    for (; !o->exiting && o->wq_bx != o->wq_ex;)
+    {
+      cmd = o->wq[o->wq_bx];
+// printf("Worker: got cmd=%u\n", cmd);
+      o->wq_bx = (o->wq_bx + 1) & WQ_MASK;
+      switch (cmd)
+      {
+      case OC_READ_DATA:
+        ci = o->adcx ^ 1;
+        l = o->line_items * o->data_rows;
+        ofs = o->page_offset;
+        if (ofs + l < 0 || ofs >= o->io_p->size) break;
+        if (ofs < 0)
+        {
+          l += ofs;
+          ofs = 0;
+        }
+        if (ofs + l > o->io_p->size)
+        {
+          l = o->io_p->size - ofs;
+        }
+        if (!l) break;
+
+        o->ofs_cache[ci] = ofs;
+// printf("READ_DATA %u\n", (int) l);
+        MUNLOCK();
+        l = extend_cache(o, ci, l);
+// printf("cache extended to %u\n", (int) l);
+        c = c41_io_p64read(o->io_p, o->data_cache[ci].a, o->ofs_cache[ci], l, 
+                           &rl);
+        if (c)
+        {
+          E(ORC_FILE_ERROR, "failed reading ofs=$Xq, size=$Xz, status=$u=$s",
+            o->ofs_cache[ci], l, c, c41_io_status_name(c));
+          rl = 0;
+        }
+// printf("read from %"PRIi64": %lu\n", o->ofs_cache[ci], (long) rl);
+        o->data_cache[ci].n = rl;
+        MLOCK();
+        o->adcx = ci;
+        if (!c && rl) 
+        {
+          oq_push(o, OC_SHOW_DATA);
+          OSIGNAL();
+        }
+        break;
+      }
+    }
+    if (o->exiting) break;
+    JWAIT();
+  }
+  sig = --(o->workers_left);
+  MUNLOCK();
+  if (sig) JSIGNAL();
+  return 0;
+
+l_thread_error:
+  return ORC_THREAD_ERROR;
+}
+
 /* set_cmd ******************************************************************/
 static int set_cmd (ochi_t * o, uint_t cmd)
 {
@@ -627,31 +1015,33 @@ static void init_default_styles (ochi_t * o)
   o->attr_a[_s].fg = (_fg), \
   o->attr_a[OS_NORMAL].mode = (_mode))
   S(OS_NORMAL, ACX1_BLACK, ACX1_LIGHT_GRAY, ACX1_NORMAL);
-  S(OS_OFS_SEP, ACX1_BLACK, ACX1_LIGHT_GRAY, ACX1_NORMAL);
-  S(OS_HEX_SEP, ACX1_BLACK, ACX1_LIGHT_GRAY, ACX1_NORMAL);
-  S(OS_ASC_SEP, ACX1_BLACK, ACX1_LIGHT_GRAY, ACX1_NORMAL);
-  S(OS_OFS, ACX1_BLACK, ACX1_LIGHT_GRAY, ACX1_NORMAL);
+  S(OS_OFS_SEP, ACX1_BLACK, ACX1_DARK_GRAY, ACX1_NORMAL);
+  S(OS_HEX_SEP, ACX1_BLACK, ACX1_DARK_GRAY, ACX1_NORMAL);
+  S(OS_ABR_SEP, ACX1_BLACK, ACX1_LIGHT_GRAY, ACX1_NORMAL);
+  S(OS_OFS, ACX1_BLACK, ACX1_LIGHT_BLUE, ACX1_NORMAL);
   S(OS_NHEX, ACX1_BLACK, ACX1_LIGHT_GRAY, ACX1_NORMAL);
   S(OS_SHEX, ACX1_BLACK, ACX1_LIGHT_GRAY, ACX1_NORMAL);
   S(OS_HHEX, ACX1_BLACK, ACX1_LIGHT_GRAY, ACX1_NORMAL);
-  S(OS_DHEX, ACX1_BLACK, ACX1_LIGHT_GRAY, ACX1_NORMAL);
-  S(OS_CHEX, ACX1_BLACK, ACX1_LIGHT_GRAY, ACX1_NORMAL);
-  S(OS_NHEX_NODATA, ACX1_BLACK, ACX1_LIGHT_GRAY, ACX1_NORMAL);
-  S(OS_SHEX_NODATA, ACX1_BLACK, ACX1_LIGHT_GRAY, ACX1_NORMAL);
-  S(OS_HHEX_NODATA, ACX1_BLACK, ACX1_LIGHT_GRAY, ACX1_NORMAL);
-  S(OS_DHEX_NODATA, ACX1_BLACK, ACX1_LIGHT_GRAY, ACX1_NORMAL);
-  S(OS_CHEX_NODATA, ACX1_BLACK, ACX1_LIGHT_GRAY, ACX1_NORMAL);
-  S(OS_NHEX_UNK, ACX1_BLACK, ACX1_LIGHT_GRAY, ACX1_NORMAL);
-  S(OS_SHEX_UNK, ACX1_BLACK, ACX1_LIGHT_GRAY, ACX1_NORMAL);
-  S(OS_HHEX_UNK, ACX1_BLACK, ACX1_LIGHT_GRAY, ACX1_NORMAL);
-  S(OS_DHEX_UNK, ACX1_BLACK, ACX1_LIGHT_GRAY, ACX1_NORMAL);
-  S(OS_CHEX_UNK, ACX1_BLACK, ACX1_LIGHT_GRAY, ACX1_NORMAL);
-  S(OS_ABR_CONTROL, ACX1_BLACK, ACX1_LIGHT_GRAY, ACX1_NORMAL);
-  S(OS_ABR_SYMBOL, ACX1_BLACK, ACX1_LIGHT_GRAY, ACX1_NORMAL);
-  S(OS_ABR_DIGIT, ACX1_BLACK, ACX1_LIGHT_GRAY, ACX1_NORMAL);
-  S(OS_ABR_LETTER, ACX1_BLACK, ACX1_LIGHT_GRAY, ACX1_NORMAL);
-  S(OS_ABR_80_BF, ACX1_BLACK, ACX1_LIGHT_GRAY, ACX1_NORMAL);
-  S(OS_ABR_C0_FF, ACX1_BLACK, ACX1_LIGHT_GRAY, ACX1_NORMAL);
+  S(OS_DHEX, ACX1_DARK_GREEN, ACX1_BLACK, ACX1_NORMAL);
+  S(OS_CHEX, ACX1_LIGHT_YELLOW, ACX1_BLACK, ACX1_NORMAL);
+  S(OS_NHEX_NODATA, ACX1_BLACK, ACX1_DARK_RED, ACX1_NORMAL);
+  S(OS_SHEX_NODATA, ACX1_BLACK, ACX1_DARK_RED, ACX1_NORMAL);
+  S(OS_HHEX_NODATA, ACX1_BLACK, ACX1_DARK_RED, ACX1_NORMAL);
+  S(OS_DHEX_NODATA, ACX1_BLACK, ACX1_DARK_RED, ACX1_NORMAL);
+  S(OS_CHEX_NODATA, ACX1_BLACK, ACX1_DARK_RED, ACX1_NORMAL);
+  S(OS_NHEX_UNK, ACX1_BLACK, ACX1_DARK_GRAY, ACX1_NORMAL);
+  S(OS_SHEX_UNK, ACX1_BLACK, ACX1_DARK_GRAY, ACX1_NORMAL);
+  S(OS_HHEX_UNK, ACX1_BLACK, ACX1_DARK_GRAY, ACX1_NORMAL);
+  S(OS_DHEX_UNK, ACX1_BLACK, ACX1_DARK_GRAY, ACX1_NORMAL);
+  S(OS_CHEX_UNK, ACX1_BLACK, ACX1_DARK_GRAY, ACX1_NORMAL);
+  S(OS_ABR_UNK, ACX1_BLACK, ACX1_LIGHT_BLUE, ACX1_NORMAL);
+  S(OS_ABR_NODATA, ACX1_BLACK, ACX1_LIGHT_BLUE, ACX1_NORMAL);
+  S(OS_ABR_CONTROL, ACX1_BLACK, ACX1_LIGHT_RED, ACX1_NORMAL);
+  S(OS_ABR_SYMBOL, ACX1_BLACK, ACX1_LIGHT_YELLOW, ACX1_NORMAL);
+  S(OS_ABR_DIGIT, ACX1_BLACK, ACX1_LIGHT_GREEN, ACX1_NORMAL);
+  S(OS_ABR_LETTER, ACX1_BLACK, ACX1_LIGHT_MAGENTA, ACX1_NORMAL);
+  S(OS_ABR_80_BF, ACX1_BLACK, ACX1_LIGHT_BLUE, ACX1_NORMAL);
+  S(OS_ABR_C0_FF, ACX1_BLACK, ACX1_LIGHT_CYAN, ACX1_NORMAL);
   S(OS_TB_TEXT, ACX1_BLACK, ACX1_LIGHT_GRAY, ACX1_NORMAL);
   S(OS_TB_NAME, ACX1_BLACK, ACX1_LIGHT_GRAY, ACX1_NORMAL);
   S(OS_TB_OFS, ACX1_BLACK, ACX1_LIGHT_GRAY, ACX1_NORMAL);
@@ -683,6 +1073,37 @@ static uint_t init_default_keys (ochi_t * o)
     || add_key_action(o, ACX1_ALT | 'x'         , OA_EXIT)
     || add_key_action(o, ACX1_ESC               , OA_EXIT)
     || add_key_action(o, 'q'                    , OA_EXIT)
+    || add_key_action(o, 'h'                    , OA_CURSOR_LEFT)
+    || add_key_action(o, ACX1_LEFT              , OA_CURSOR_LEFT)
+    || add_key_action(o, 'j'                    , OA_CURSOR_DOWN)
+    || add_key_action(o, ACX1_DOWN              , OA_CURSOR_DOWN)
+    || add_key_action(o, 'k'                    , OA_CURSOR_UP)
+    || add_key_action(o, ACX1_UP                , OA_CURSOR_UP)
+    || add_key_action(o, 'l'                    , OA_CURSOR_RIGHT)
+    || add_key_action(o, ACX1_RIGHT             , OA_CURSOR_RIGHT)
+    || add_key_action(o, 'H'                    , OA_CURSOR_HIGH)
+    || add_key_action(o, 'M'                    , OA_CURSOR_MED)
+    || add_key_action(o, 'L'                    , OA_CURSOR_LOW)
+    || add_key_action(o, 'g'                    , OA_CURSOR_GO)
+    || add_key_action(o, ACX1_CTRL | ACX1_HOME  , OA_CURSOR_GO)
+    || add_key_action(o, ACX1_CTRL | ACX1_PAGE_UP, OA_CURSOR_GO)
+    || add_key_action(o, 'G'                    , OA_CURSOR_END)
+    || add_key_action(o, ACX1_CTRL | ACX1_END   , OA_CURSOR_END)
+    || add_key_action(o, ACX1_CTRL | ACX1_PAGE_DOWN, OA_CURSOR_END)
+    || add_key_action(o, '^'                    , OA_CURSOR_BOL)
+    || add_key_action(o, ACX1_HOME              , OA_CURSOR_BOL)
+    || add_key_action(o, '$'                    , OA_CURSOR_EOL)
+    || add_key_action(o, ACX1_END               , OA_CURSOR_EOL)
+    || add_key_action(o, '%'                    , OA_CURSOR_PERC)
+    || add_key_action(o, 'B' | ACX1_CTRL        , OA_CURSOR_PAGE_UP)
+    || add_key_action(o, ACX1_PAGE_UP           , OA_CURSOR_PAGE_UP)
+    || add_key_action(o, 'F' | ACX1_CTRL        , OA_CURSOR_PAGE_DOWN)
+    || add_key_action(o, ACX1_PAGE_DOWN         , OA_CURSOR_PAGE_DOWN)
+    || add_key_action(o, '%'                    , OA_CURSOR_PERC)
+    || add_key_action(o, '-'                    , OA_DEC_WIDTH)
+    || add_key_action(o, '='                    , OA_INC_WIDTH)
+    || add_key_action(o, '<'                    , OA_SLIDE_LEFT)
+    || add_key_action(o, '>'                    , OA_SLIDE_RIGHT)
     ;
 }
 
@@ -699,6 +1120,8 @@ static void init (ochi_t * o, c41_cli_t * cli_p)
   o->fspi_p = cli_p->fspi_p;
   c41_u8v_init(&o->emsg, cli_p->ma_p, 20);
   c41_u8v_init(&o->out_data, o->ma_p, 16);
+  c41_u8v_init(&o->data_cache[0], o->ma_p, 16);
+  c41_u8v_init(&o->data_cache[1], o->ma_p, 16);
   c41_pv_init(&o->out_lines, o->ma_p, 16);
   kapv_init(&o->kapv, o->ma_p, 8);
 
@@ -710,8 +1133,8 @@ static void init (ochi_t * o, c41_cli_t * cli_p)
   o->abr_sep = "  ";
   o->hex_sep[0] = " ";
   o->hex_sep[1] = " ";
-  o->hex_sep[2] = "  ";
-  o->hex_sep[3] = "  ";
+  o->hex_sep[2] = ":";
+  o->hex_sep[3] = "|";
 
   init_default_styles(o);
   if (init_default_keys(o)) return;
@@ -815,6 +1238,9 @@ static void finish (ochi_t * o)
     c = c41_smt_mutex_destroy(o->main_mutex_p, o->smt_p, o->ma_p);
     if (c) E(OE_MAIN_MUTEX_DESTROY, "failed destroying mutex: $i", c);
   }
+
+  c41_u8v_free(&o->data_cache[0]);
+  c41_u8v_free(&o->data_cache[1]);
 }
 
 /* run_ui *******************************************************************/
@@ -958,6 +1384,69 @@ static void test_ui (ochi_t * o)
   run_ui(o);
 }
 
+/* start_workers ************************************************************/
+static uint8_t start_workers (ochi_t * o)
+{
+  uint_t i, c;
+
+  c = c41_smt_cond_create(&o->job_cond_p, o->smt_p, o->ma_p);
+  if (c)
+  {
+    E(OE_WORKER_COND_CREATE, 
+      "failed creating job condition variable $i", c);
+    return ORC_THREAD_ERROR;
+  }
+  o->job_cond_inited = 1;
+
+  for (i = 0; i < NUM_WORKERS; ++i)
+  {
+    c = c41_smt_thread_create(o->smt_p, &o->worker_tid_a[i], worker, o);
+    if (c)
+    {
+      E(OE_WORKER_THREAD_CREATE,
+        "failed creating worker #$i (error code $i)", i, c);
+      return ORC_THREAD_ERROR;
+    }
+  }
+  o->worker_n = i;
+  o->workers_left = i;
+
+  return 0;
+}
+
+/* stop_workers *************************************************************/
+static uint8_t stop_workers (ochi_t * o)
+{
+  uint_t i, c;
+  int tc;
+
+  JSIGNAL();
+  for (i = 0; i < o->worker_n; ++i)
+  {
+    tc = c41_smt_thread_join(o->smt_p, o->worker_tid_a[i]);
+    if (tc < 0)
+    {
+      E(OE_WORKER_THREAD_JOIN, "failed joining worker thread #$i (error $i)",
+        i, tc);
+      o->orc |= ORC_THREAD_ERROR;
+    }
+  }
+
+  if (o->job_cond_inited)
+  {
+    c = c41_smt_cond_destroy(o->job_cond_p, o->smt_p, o->ma_p);
+    if (c)
+    {
+      E(OE_WORKER_COND_DESTROY, 
+        "failed destroying job condition var (code $i)", c);
+    }
+  }
+
+  return 0;
+l_thread_error:
+  return ORC_THREAD_ERROR;
+}
+
 /* cmd_main *****************************************************************/
 static void cmd_main (ochi_t * o)
 {
@@ -1011,10 +1500,14 @@ static void cmd_main (ochi_t * o)
     else prepare_offset_format(o);
   }
 
+  o->orc |= start_workers(o);
+
   if (!o->orc)
   {
     run_ui(o);
   }
+
+  stop_workers(o);
 
   if (o->io_p)
   {
@@ -1030,9 +1523,9 @@ static void cmd_main (ochi_t * o)
 static void prepare_offset_format (ochi_t * o)
 {
   uint_t i;
-  uint64_t l = o->io_p->size + 0x10000;
+  uint64_t l = o->io_p->size + 0x1000;
 
-  for (i = 4; i < 16 && l <= (1 << (i * 4)); ++i);
+  for (i = 4; i < 16 && l >= ((uint64_t) 1 << (i * 4)); ++i);
   c41_sfmt(o->ofs_fmt, sizeof(o->ofs_fmt), "$$+HG4.$iq", i);
   //printf("fmt: %s\n", o->ofs_fmt);
 }
