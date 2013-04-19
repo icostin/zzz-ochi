@@ -177,6 +177,8 @@ enum ochi_action_enum
   OA_CURSOR_END,
   OA_CURSOR_PAGE_UP,
   OA_CURSOR_PAGE_DOWN,
+  OA_CURSOR_BLOCK_UP,
+  OA_CURSOR_BLOCK_DOWN,
   OA_CURSOR_BOL,
   OA_CURSOR_EOL,
   OA_CURSOR_PERC,
@@ -473,6 +475,14 @@ static void move_cursor (ochi_t * o, int action)
     new_pos = o->offset - (o->data_rows - 1) * o->line_items;
     o->page_offset -= (o->data_rows - 1) * o->line_items;
     break;
+  case OA_CURSOR_BLOCK_DOWN:
+    new_pos = o->offset + (o->data_rows / 3) * o->line_items;
+    o->page_offset += (o->data_rows - 1) * o->line_items;
+    break;
+  case OA_CURSOR_BLOCK_UP:
+    new_pos = o->offset - (o->data_rows / 3) * o->line_items;
+    o->page_offset -= (o->data_rows - 1) * o->line_items;
+    break;
   case OA_CURSOR_BOL:
     new_pos = o->offset - o->item_col;
     break;
@@ -582,6 +592,8 @@ static uint8_t C41_CALL input_reader (void * arg)
       case OA_CURSOR_END:
       case OA_CURSOR_PAGE_UP:
       case OA_CURSOR_PAGE_DOWN:
+      case OA_CURSOR_BLOCK_UP:
+      case OA_CURSOR_BLOCK_DOWN:
       case OA_CURSOR_BOL:
       case OA_CURSOR_EOL:
       case OA_CURSOR_PERC:
@@ -1068,7 +1080,7 @@ static void init_default_styles (ochi_t * o)
   S(OS_HHEX_UNK, ACX1_BLACK, ACX1_DARK_GRAY, ACX1_NORMAL);
   S(OS_DHEX_UNK, ACX1_DARK_GREEN, ACX1_DARK_GRAY, ACX1_NORMAL);
   S(OS_CHEX_UNK, ACX1_DARK_YELLOW, ACX1_DARK_GRAY, ACX1_NORMAL);
-  S(OS_ABR_UNK, ACX1_BLACK, ACX1_LIGHT_BLUE, ACX1_NORMAL);
+  S(OS_ABR_UNK, ACX1_BLACK, ACX1_DARK_GRAY, ACX1_NORMAL);
   S(OS_ABR_NODATA, ACX1_BLACK, ACX1_LIGHT_BLUE, ACX1_NORMAL);
   S(OS_ABR_CONTROL, ACX1_BLACK, ACX1_LIGHT_RED, ACX1_NORMAL);
   S(OS_ABR_SYMBOL, ACX1_BLACK, ACX1_LIGHT_YELLOW, ACX1_NORMAL);
@@ -1141,6 +1153,8 @@ static uint_t init_default_keys (ochi_t * o)
     || add_key_action(o, ACX1_PAGE_UP           , OA_CURSOR_PAGE_UP)
     || add_key_action(o, 'F' | ACX1_CTRL        , OA_CURSOR_PAGE_DOWN)
     || add_key_action(o, ACX1_PAGE_DOWN         , OA_CURSOR_PAGE_DOWN)
+    || add_key_action(o, 'U' | ACX1_CTRL        , OA_CURSOR_BLOCK_UP)
+    || add_key_action(o, 'D' | ACX1_CTRL        , OA_CURSOR_BLOCK_DOWN)
     || add_key_action(o, '%'                    , OA_CURSOR_PERC)
     || add_key_action(o, '-'                    , OA_DEC_WIDTH)
     || add_key_action(o, '='                    , OA_INC_WIDTH)
