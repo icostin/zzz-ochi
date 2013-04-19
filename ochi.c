@@ -184,16 +184,26 @@ enum ochi_action_enum
   OA_INC_WIDTH,
   OA_SLIDE_LEFT,
   OA_SLIDE_RIGHT,
+  OA_SLIDE_UP,
+  OA_SLIDE_DOWN,
 };
 
+/*
+ * active | inactive
+ * cursor | directional | non-directional
+ * selected | non-selected
+ * highlighted | non-highlighted * 4
+ */
 enum ochi_style_enum
 {
   OS_NORMAL0 = 0,
   OS_NORMAL,
   OS_OFS_SEP,
   OS_HEX_SEP,
+  OS_DHEX_SEP,
   OS_ABR_SEP,
-  OS_OFS,
+  OS_NOFS,
+  OS_DOFS,
   OS_NHEX, // normal
   OS_SHEX, // selection
   OS_HHEX, // highlight (search matches)
@@ -217,6 +227,14 @@ enum ochi_style_enum
   OS_ABR_C0_FF,
   OS_ABR_UNK,
   OS_ABR_NODATA,
+  OS_CABR_CONTROL,
+  OS_CABR_SYMBOL,
+  OS_CABR_DIGIT,
+  OS_CABR_LETTER,
+  OS_CABR_80_BF,
+  OS_CABR_C0_FF,
+  OS_CABR_UNK,
+  OS_CABR_NODATA,
   OS_TB_TEXT, // title bar - static text
   OS_TB_EM, // text with emphasis
   OS_TB_NAME, // title bar - name
@@ -481,6 +499,14 @@ static void move_cursor (ochi_t * o, int action)
     new_pos = o->offset;
     o->page_offset -= 1;
     break;
+  case OA_SLIDE_UP:
+    new_pos = o->offset;
+    o->page_offset -= o->line_items;
+    break;
+  case OA_SLIDE_DOWN:
+    new_pos = o->offset;
+    o->page_offset += o->line_items;
+    break;
   default:
     new_pos = o->offset;
   }
@@ -563,6 +589,8 @@ static uint8_t C41_CALL input_reader (void * arg)
       case OA_INC_WIDTH:
       case OA_SLIDE_LEFT:
       case OA_SLIDE_RIGHT:
+      case OA_SLIDE_UP:
+      case OA_SLIDE_DOWN:
         move_cursor(o, action);
         break;
       default:
@@ -602,7 +630,7 @@ static uint8_t C41_CALL render_cached_data (ochi_t * o)
   o->out_data.n = 0;
   for (gunk = i = 0; i < o->data_rows; ++i)
   {
-    O("\a$c", OS_OFS);
+    O("\a$c", (i == o->item_row) ? OS_DOFS : OS_NOFS);
     O(o->ofs_fmt, o->page_offset + i * o->line_items);
     O("\a$c$s", OS_OFS_SEP, o->ofs_sep);
 
@@ -612,7 +640,8 @@ static uint8_t C41_CALL render_cached_data (ochi_t * o)
       {
         // put separator between hex
         for (k = 3; k > 0 && (((1 << k) - 1) & j); --k);
-        O("\a$c$s", OS_HEX_SEP, o->hex_sep[k]);
+        O("\a$c$s", (i == o->item_row) ? OS_DHEX_SEP : OS_HEX_SEP, 
+          o->hex_sep[k]);
       }
 
       v = cached_byte(o, o->page_offset + i * o->line_items + j);
@@ -644,11 +673,14 @@ static uint8_t C41_CALL render_cached_data (ochi_t * o)
     O("\a$c$s", OS_ABR_SEP, o->abr_sep);
     for (j = 0; j < o->line_items; ++j)
     {
+      int sty;
       v = cached_byte(o, o->page_offset + i * o->line_items + j);
-      O("\a$c$c", abr_style(v), abr_ch(v));
+      sty = abr_style(v);
+      if (i == o->item_row && j == o->item_col) sty += OS_CABR_UNK - OS_ABR_UNK;
+      O("\a$c$c", sty, abr_ch(v));
     }
 
-    O("$c", 0);
+    O("\a$c $c", OS_NORMAL, 0);
   }
   if (gunk) 
   {
@@ -1017,23 +1049,25 @@ static void init_default_styles (ochi_t * o)
   S(OS_NORMAL, ACX1_BLACK, ACX1_LIGHT_GRAY, ACX1_NORMAL);
   S(OS_OFS_SEP, ACX1_BLACK, ACX1_DARK_GRAY, ACX1_NORMAL);
   S(OS_HEX_SEP, ACX1_BLACK, ACX1_DARK_GRAY, ACX1_NORMAL);
+  S(OS_DHEX_SEP, ACX1_DARK_GREEN, ACX1_DARK_GRAY, ACX1_NORMAL);
   S(OS_ABR_SEP, ACX1_BLACK, ACX1_LIGHT_GRAY, ACX1_NORMAL);
-  S(OS_OFS, ACX1_BLACK, ACX1_LIGHT_BLUE, ACX1_NORMAL);
+  S(OS_NOFS, ACX1_BLACK, ACX1_LIGHT_BLUE, ACX1_NORMAL);
+  S(OS_DOFS, ACX1_DARK_CYAN, ACX1_LIGHT_RED, ACX1_NORMAL);
   S(OS_NHEX, ACX1_BLACK, ACX1_LIGHT_GRAY, ACX1_NORMAL);
   S(OS_SHEX, ACX1_BLACK, ACX1_LIGHT_GRAY, ACX1_NORMAL);
   S(OS_HHEX, ACX1_BLACK, ACX1_LIGHT_GRAY, ACX1_NORMAL);
   S(OS_DHEX, ACX1_DARK_GREEN, ACX1_BLACK, ACX1_NORMAL);
   S(OS_CHEX, ACX1_LIGHT_YELLOW, ACX1_BLACK, ACX1_NORMAL);
-  S(OS_NHEX_NODATA, ACX1_BLACK, ACX1_DARK_RED, ACX1_NORMAL);
-  S(OS_SHEX_NODATA, ACX1_BLACK, ACX1_DARK_RED, ACX1_NORMAL);
-  S(OS_HHEX_NODATA, ACX1_BLACK, ACX1_DARK_RED, ACX1_NORMAL);
-  S(OS_DHEX_NODATA, ACX1_BLACK, ACX1_DARK_RED, ACX1_NORMAL);
-  S(OS_CHEX_NODATA, ACX1_BLACK, ACX1_DARK_RED, ACX1_NORMAL);
+  S(OS_NHEX_NODATA, ACX1_BLACK, ACX1_DARK_GRAY, ACX1_NORMAL);
+  S(OS_SHEX_NODATA, ACX1_BLACK, ACX1_DARK_GRAY, ACX1_NORMAL);
+  S(OS_HHEX_NODATA, ACX1_BLACK, ACX1_DARK_GRAY, ACX1_NORMAL);
+  S(OS_DHEX_NODATA, ACX1_DARK_GREEN, ACX1_DARK_GRAY, ACX1_NORMAL);
+  S(OS_CHEX_NODATA, ACX1_DARK_YELLOW, ACX1_DARK_GRAY, ACX1_NORMAL);
   S(OS_NHEX_UNK, ACX1_BLACK, ACX1_DARK_GRAY, ACX1_NORMAL);
   S(OS_SHEX_UNK, ACX1_BLACK, ACX1_DARK_GRAY, ACX1_NORMAL);
   S(OS_HHEX_UNK, ACX1_BLACK, ACX1_DARK_GRAY, ACX1_NORMAL);
-  S(OS_DHEX_UNK, ACX1_BLACK, ACX1_DARK_GRAY, ACX1_NORMAL);
-  S(OS_CHEX_UNK, ACX1_BLACK, ACX1_DARK_GRAY, ACX1_NORMAL);
+  S(OS_DHEX_UNK, ACX1_DARK_GREEN, ACX1_DARK_GRAY, ACX1_NORMAL);
+  S(OS_CHEX_UNK, ACX1_DARK_YELLOW, ACX1_DARK_GRAY, ACX1_NORMAL);
   S(OS_ABR_UNK, ACX1_BLACK, ACX1_LIGHT_BLUE, ACX1_NORMAL);
   S(OS_ABR_NODATA, ACX1_BLACK, ACX1_LIGHT_BLUE, ACX1_NORMAL);
   S(OS_ABR_CONTROL, ACX1_BLACK, ACX1_LIGHT_RED, ACX1_NORMAL);
@@ -1042,6 +1076,14 @@ static void init_default_styles (ochi_t * o)
   S(OS_ABR_LETTER, ACX1_BLACK, ACX1_LIGHT_MAGENTA, ACX1_NORMAL);
   S(OS_ABR_80_BF, ACX1_BLACK, ACX1_LIGHT_BLUE, ACX1_NORMAL);
   S(OS_ABR_C0_FF, ACX1_BLACK, ACX1_LIGHT_CYAN, ACX1_NORMAL);
+  S(OS_CABR_UNK, ACX1_DARK_YELLOW, ACX1_LIGHT_BLUE, ACX1_NORMAL);
+  S(OS_CABR_NODATA, ACX1_DARK_YELLOW, ACX1_LIGHT_BLUE, ACX1_NORMAL);
+  S(OS_CABR_CONTROL, ACX1_DARK_YELLOW, ACX1_LIGHT_RED, ACX1_NORMAL);
+  S(OS_CABR_SYMBOL, ACX1_DARK_YELLOW, ACX1_LIGHT_YELLOW, ACX1_NORMAL);
+  S(OS_CABR_DIGIT, ACX1_DARK_YELLOW, ACX1_LIGHT_GREEN, ACX1_NORMAL);
+  S(OS_CABR_LETTER, ACX1_DARK_YELLOW, ACX1_LIGHT_MAGENTA, ACX1_NORMAL);
+  S(OS_CABR_80_BF, ACX1_DARK_YELLOW, ACX1_LIGHT_BLUE, ACX1_NORMAL);
+  S(OS_CABR_C0_FF, ACX1_DARK_YELLOW, ACX1_LIGHT_CYAN, ACX1_NORMAL);
   S(OS_TB_TEXT, ACX1_BLACK, ACX1_LIGHT_GRAY, ACX1_NORMAL);
   S(OS_TB_NAME, ACX1_BLACK, ACX1_LIGHT_GRAY, ACX1_NORMAL);
   S(OS_TB_OFS, ACX1_BLACK, ACX1_LIGHT_GRAY, ACX1_NORMAL);
@@ -1103,7 +1145,11 @@ static uint_t init_default_keys (ochi_t * o)
     || add_key_action(o, '-'                    , OA_DEC_WIDTH)
     || add_key_action(o, '='                    , OA_INC_WIDTH)
     || add_key_action(o, '<'                    , OA_SLIDE_LEFT)
+    || add_key_action(o, ACX1_CTRL | ACX1_LEFT  , OA_SLIDE_LEFT)
     || add_key_action(o, '>'                    , OA_SLIDE_RIGHT)
+    || add_key_action(o, ACX1_CTRL | ACX1_RIGHT , OA_SLIDE_RIGHT)
+    || add_key_action(o, ACX1_CTRL | 'E'        , OA_SLIDE_DOWN)
+    || add_key_action(o, ACX1_CTRL | 'Y'        , OA_SLIDE_UP)
     ;
 }
 
@@ -1133,8 +1179,8 @@ static void init (ochi_t * o, c41_cli_t * cli_p)
   o->abr_sep = "  ";
   o->hex_sep[0] = " ";
   o->hex_sep[1] = " ";
-  o->hex_sep[2] = ":";
-  o->hex_sep[3] = "|";
+  o->hex_sep[2] = "  ";
+  o->hex_sep[3] = "  ";
 
   init_default_styles(o);
   if (init_default_keys(o)) return;
