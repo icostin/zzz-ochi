@@ -1,9 +1,12 @@
 #include <stdio.h>
-#include <inttypes.h>
 #include <c41.h>
 #include <hbs1.h>
 #include <acx1.h>
 
+#if __GNUC__
+#include <inttypes.h>
+#else
+#endif
 #define NUM_WORKERS             2
 
 #define MIN_WIDTH               40
@@ -20,6 +23,13 @@
 #define ORC_THREAD_ERROR        0x10
 #define ORC_CLI_ERROR           0x20
 #define ORC_MISC_ERROR          0x40
+
+#define E(_eid, ...)                                                          \
+  if (!(c41_u8v_afmt(&o->emsg, __VA_ARGS__) ||                                \
+        c41_u8v_afmt(&o->emsg, " (code $i: $s, line $i)\n",                   \
+                     (o->eid = (_eid)), ename(_eid), __LINE__)))             \
+    /*printf("\nErrors:\n%s\n", o->emsg.a)*/; \
+  else (o->orc |= ORC_REPORT_ERROR)
 
 #define MLOCK() do { uint_t c;                                  \
     /*printf("locking... (line %d)\n", __LINE__);*/ \
@@ -272,7 +282,7 @@ struct ochi_s
   uint_t        mode;
 
   c41_u8v_t     data_cache[2];
-  uint64_t      ofs_cache[2];
+  int64_t       ofs_cache[2];
   char const *  ofs_sep;
   char const *  abr_sep;
   char const *  hex_sep[4];
@@ -319,13 +329,9 @@ struct ochi_s
   uint8_t       job_cond_inited;
   uint8_t       exiting;
   uint8_t       screen_too_small;
-};
 
-#define E(_eid, ...)                                                          \
-  if (!(c41_u8v_afmt(&o->emsg, __VA_ARGS__) ||                                \
-        c41_u8v_afmt(&o->emsg, " (code $i: $s, line $i)\n",                   \
-                     (o->eid = (_eid)), ename(_eid), __LINE__))) ;            \
-  else (o->orc |= ORC_REPORT_ERROR)
+  c41_io_t *    log_io_p;
+};
 
 static char const help_msg[] =
  "ochi - data viewer\n"
@@ -533,8 +539,8 @@ static void move_cursor (ochi_t * o, int action)
       ((new_pos + o->line_items - page_end) / o->line_items);
   }
   /* now new pos should be inside the screen */
-  o->item_row = (new_pos - o->page_offset) / o->line_items;
-  o->item_col = new_pos - o->page_offset - o->item_row * o->line_items;
+  o->item_row = (uint_t) (new_pos - o->page_offset) / o->line_items;
+  o->item_col = (uint_t) (new_pos - o->page_offset) - o->item_row * o->line_items;
 
   if (o->offset != new_pos) oq_push(o, OC_SHOW_TITLE_BAR);
   o->offset = new_pos;
@@ -945,8 +951,8 @@ l_acx_error:
   return ORC_ACX_ERROR;
 l_thread_error:
   return ORC_THREAD_ERROR;
-l_mem_error:
-  return ORC_MEM_ERROR;
+// l_mem_error:
+//   return ORC_MEM_ERROR;
 }
 
 /* extend_cache *************************************************************/
@@ -981,7 +987,7 @@ static uint8_t C41_CALL worker (void * arg)
     for (; !o->exiting && o->wq_bx != o->wq_ex;)
     {
       cmd = o->wq[o->wq_bx];
-// printf("Worker: got cmd=%u\n", cmd);
+//printf("Worker: got cmd=%u\n", cmd);
       o->wq_bx = (o->wq_bx + 1) & WQ_MASK;
       switch (cmd)
       {
@@ -1002,10 +1008,10 @@ static uint8_t C41_CALL worker (void * arg)
         if (!l) break;
 
         o->ofs_cache[ci] = ofs;
-// printf("READ_DATA %u\n", (int) l);
+//printf("READ_DATA %u\n", (int) l);
         MUNLOCK();
         l = extend_cache(o, ci, l);
-// printf("cache extended to %u\n", (int) l);
+//printf("cache extended to %u\n", (int) l);
         c = c41_io_p64read(o->io_p, o->data_cache[ci].a, o->ofs_cache[ci], l, 
                            &rl);
         if (c)
@@ -1061,24 +1067,24 @@ static void init_default_styles (ochi_t * o)
   S(OS_NORMAL, ACX1_BLACK, ACX1_LIGHT_GRAY, ACX1_NORMAL);
   S(OS_OFS_SEP, ACX1_BLACK, ACX1_DARK_GRAY, ACX1_NORMAL);
   S(OS_HEX_SEP, ACX1_BLACK, ACX1_DARK_GRAY, ACX1_NORMAL);
-  S(OS_DHEX_SEP, ACX1_DARK_GREEN, ACX1_DARK_GRAY, ACX1_NORMAL);
+  S(OS_DHEX_SEP, ACX1_DARK_BLUE, ACX1_LIGHT_GRAY, ACX1_NORMAL);
   S(OS_ABR_SEP, ACX1_BLACK, ACX1_LIGHT_GRAY, ACX1_NORMAL);
   S(OS_NOFS, ACX1_BLACK, ACX1_LIGHT_BLUE, ACX1_NORMAL);
   S(OS_DOFS, ACX1_DARK_CYAN, ACX1_LIGHT_RED, ACX1_NORMAL);
   S(OS_NHEX, ACX1_BLACK, ACX1_LIGHT_GRAY, ACX1_NORMAL);
   S(OS_SHEX, ACX1_BLACK, ACX1_LIGHT_GRAY, ACX1_NORMAL);
   S(OS_HHEX, ACX1_BLACK, ACX1_LIGHT_GRAY, ACX1_NORMAL);
-  S(OS_DHEX, ACX1_DARK_GREEN, ACX1_BLACK, ACX1_NORMAL);
+  S(OS_DHEX, ACX1_DARK_BLUE, ACX1_LIGHT_GRAY, ACX1_NORMAL);
   S(OS_CHEX, ACX1_LIGHT_YELLOW, ACX1_BLACK, ACX1_NORMAL);
   S(OS_NHEX_NODATA, ACX1_BLACK, ACX1_DARK_GRAY, ACX1_NORMAL);
   S(OS_SHEX_NODATA, ACX1_BLACK, ACX1_DARK_GRAY, ACX1_NORMAL);
   S(OS_HHEX_NODATA, ACX1_BLACK, ACX1_DARK_GRAY, ACX1_NORMAL);
-  S(OS_DHEX_NODATA, ACX1_DARK_GREEN, ACX1_DARK_GRAY, ACX1_NORMAL);
+  S(OS_DHEX_NODATA, ACX1_DARK_BLUE, ACX1_LIGHT_GRAY, ACX1_NORMAL);
   S(OS_CHEX_NODATA, ACX1_DARK_YELLOW, ACX1_DARK_GRAY, ACX1_NORMAL);
   S(OS_NHEX_UNK, ACX1_BLACK, ACX1_DARK_GRAY, ACX1_NORMAL);
   S(OS_SHEX_UNK, ACX1_BLACK, ACX1_DARK_GRAY, ACX1_NORMAL);
   S(OS_HHEX_UNK, ACX1_BLACK, ACX1_DARK_GRAY, ACX1_NORMAL);
-  S(OS_DHEX_UNK, ACX1_DARK_GREEN, ACX1_DARK_GRAY, ACX1_NORMAL);
+  S(OS_DHEX_UNK, ACX1_DARK_BLUE, ACX1_LIGHT_GRAY, ACX1_NORMAL);
   S(OS_CHEX_UNK, ACX1_DARK_YELLOW, ACX1_DARK_GRAY, ACX1_NORMAL);
   S(OS_ABR_UNK, ACX1_BLACK, ACX1_DARK_GRAY, ACX1_NORMAL);
   S(OS_ABR_NODATA, ACX1_BLACK, ACX1_LIGHT_BLUE, ACX1_NORMAL);
@@ -1212,7 +1218,7 @@ static void init (ochi_t * o, c41_cli_t * cli_p)
     return;
   }
 
-  for (state = 0, i = 0; i < cli_p->arg_n; )
+  for (state = 0, i = j = 0; i < cli_p->arg_n; )
   {
     switch (state)
     {
@@ -1274,6 +1280,9 @@ static void init (ochi_t * o, c41_cli_t * cli_p)
       case 'h':
         if (set_cmd(o, OCMD_HELP)) return;
         ++j;
+        break;
+      case 'l':
+        // todo: open log
         break;
       case 't':
         if (set_cmd(o, OCMD_TEST_UI)) return;
@@ -1560,14 +1569,13 @@ static void cmd_main (ochi_t * o)
     else prepare_offset_format(o);
   }
 
-  o->orc |= start_workers(o);
 
   if (!o->orc)
   {
+    o->orc |= start_workers(o);
     run_ui(o);
+    stop_workers(o);
   }
-
-  stop_workers(o);
 
   if (o->io_p)
   {
