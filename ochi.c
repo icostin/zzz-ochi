@@ -1542,8 +1542,9 @@ static void cmd_main (ochi_t * o)
   }
   z = o->fspi_p->fsp_from_utf8(path.a, path.m, o->fname,
                                C41_STR_LEN(o->fname));
-  fsi_rc = c41_file_open(o->fsi_p, &o->io_p, path.a, z,
-                    C41_FSI_EXF_OPEN | C41_FSI_NEWF_REJECT | C41_FSI_READ);
+  fsi_rc = c41_file_open_fsp(path.a, z,
+                    C41_FSI_EXF_OPEN | C41_FSI_NEWF_REJECT | C41_FSI_READ, 
+                    o->fsi_p, &o->io_p);
   if (fsi_rc)
   {
     E(OE_FILE_OPEN, "file open failed for '$s': $s = $i",
